@@ -227,6 +227,12 @@ fn domain() -> String {
 fn install(login: bool) {
     // A plain reinstall keeps an existing login agent.
     let login = login || plist_path().exists();
+    // A fresh HOME may not have LaunchAgents yet. Prepare it before
+    // unloading the old agent, so a failure leaves the daemon running.
+    if login {
+        let plist = plist_path();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap_or_else(|e| die(&format!("create LaunchAgents directory: {e}")));
+    }
     let bin = PathBuf::from(home()).join(".local/bin/fsearch");
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     // Replace, never overwrite in place: a rewritten signed binary at the same
