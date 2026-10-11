@@ -1,5 +1,6 @@
 //! The `fsearch` binary, run with HOME (so its data dir) and FSEARCH_ROOT
-//! in a temp folder. Never `install`/`uninstall`: those drive launchctl.
+//! in a temp folder. Installation tests replace launchctl with a local
+//! stub, so they never change the user's launchd session.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -100,6 +101,31 @@ fn bench_needs_an_index() {
     let o = h.run(&["bench", "x"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(err(&o).contains("no index yet"));
+}
+
+/// A first login installation creates its LaunchAgents directory. Only
+/// the stub is on PATH: even a failed stub cannot reach real launchctl.
+#[test]
+fn install_login_with_a_fresh_home() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Home::new("install-login");
+    let stubs = h.0.join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    let stub = stubs.join("launchctl");
+    std::fs::write(&stub, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FSEARCH_TEST_LAUNCHCTL_LOG\"\nexit 0\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let calls = h.0.join("launchctl.log");
+    let plist = h.0.join("Library/LaunchAgents/mt.nd.fsearch.plist");
+    assert!(!plist.parent().unwrap().exists());
+    let o = h.cmd(&["install", "--login"]).env("PATH", &stubs).env("FSEARCH_TEST_LAUNCHCTL_LOG", &calls).output().unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let bin = h.0.join(".local/bin/fsearch");
+    assert_eq!(std::fs::read(&bin).unwrap(), std::fs::read(env!("CARGO_BIN_EXE_fsearch")).unwrap());
+    let plist_text = std::fs::read_to_string(&plist).unwrap();
+    assert!(plist_text.contains(bin.to_str().unwrap()) && plist_text.contains("<string>serve</string>"), "{plist_text}");
+    let domain = format!("gui/{}", unsafe { libc::getuid() });
+    assert_eq!(std::fs::read_to_string(calls).unwrap(), format!("bootout {domain}/mt.nd.fsearch\nbootstrap {domain} {}\n", plist.display()));
+    assert!(!h.data().join("socket.lock").exists(), "the stub must not start a daemon");
 }
 
 #[test]

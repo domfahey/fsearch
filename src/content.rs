@@ -29,7 +29,10 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG03";
+// v4 preserves nanosecond mtimes and distinguishes failed reads. Coarse
+// segments from older versions must be rebuilt, rather than trusted as fresh.
+const MAGIC: &[u8; 8] = b"FSCSEG04";
+const NANOS: u64 = 1_000_000_000;
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -96,11 +99,12 @@ enum S {
     Mtime,
     ByPath,
     Rank,
+    MtimeNsec,
 }
-const NS: usize = 9;
+const NS: usize = 10;
 
 fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize) -> [usize; NS] {
-    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs]
+    [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, ndocs * 4]
 }
 
 impl Segment {
@@ -113,6 +117,11 @@ impl Segment {
     sec!(mtime, S::Mtime, u32, ndocs);
     sec!(by_path, S::ByPath, u32, ndocs);
     sec!(rank, S::Rank, i8, ndocs);
+    sec!(mtime_nsec, S::MtimeNsec, u32, ndocs);
+
+    fn precise_mtime(&self, d: usize) -> u64 {
+        self.mtime()[d] as u64 * NANOS + self.mtime_nsec()[d] as u64
+    }
 
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
@@ -338,13 +347,28 @@ fn symbols(buf: &[u8], out: &mut Vec<u32>) {
 #[derive(Default)]
 pub struct Docs {
     buf: Vec<u8>,
-    items: Vec<(u32, u32, u64, u32)>,
+    items: Vec<(u32, u32, u64, u64)>,
 }
 
 impl Docs {
+    #[cfg(test)]
     fn push(&mut self, path: &[u8], size: u64, mtime: u32) {
+        // Name metadata deliberately has only seconds. Content invalidation
+        // needs the actual file timestamp, independently of the name cache.
+        let (size, mtime) = disk_stamp(path).unwrap_or((size, mtime as u64 * NANOS));
+        self.push_stamp(path, size, mtime);
+    }
+    fn push_stamp(&mut self, path: &[u8], size: u64, mtime: u64) {
         self.items.push((self.buf.len() as u32, path.len() as u32, size, mtime));
         self.buf.extend_from_slice(path);
+    }
+    pub(crate) fn refresh_stamps(&mut self) {
+        let buf = &self.buf;
+        for (off, len, size, mtime) in &mut self.items {
+            if let Some(stamp) = disk_stamp(&buf[*off as usize..(*off + *len) as usize]) {
+                (*size, *mtime) = stamp;
+            }
+        }
     }
     fn path(&self, i: usize) -> &[u8] {
         let (o, l, _, _) = self.items[i];
@@ -386,11 +410,28 @@ impl Docs {
 /// Rank of a doc that turned out not to be text: kept so diffs know we
 /// looked at it, never a candidate.
 const NOT_TEXT: i8 = i8::MIN;
+/// An unsuccessful read says nothing about text eligibility. Retried by
+/// subsequent syncs and the engine's bounded background retry.
+const READ_FAILED: i8 = i8::MIN + 1;
+
+fn stamp(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.len(), meta.mtime().clamp(0, u32::MAX as i64) as u64 * NANOS + meta.mtime_nsec().max(0) as u64)
+}
+
+fn disk_stamp(path: &[u8]) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path)).ok().map(|m| stamp(&m))
+}
+
+fn mtime_seconds(mtime: u64) -> u32 {
+    (mtime / NANOS).min(u32::MAX as u64) as u32
+}
 
 struct DocMeta<'a> {
     path: &'a [u8],
     size: u64,
-    mtime: u32,
+    mtime: u64,
     rank: i8,
 }
 
@@ -402,7 +443,16 @@ struct Split {
     buf: Vec<u8>,
     flat: Vec<u32>,
     syms: Vec<u32>,
-    docs: Vec<(usize, u32, u32, bool, u32, u32)>, // (doc, tri start, len, is_text, sym start, len)
+    docs: Vec<BuiltDoc>,
+}
+
+struct BuiltDoc {
+    input: usize,
+    trigrams: (u32, u32),
+    symbols: (u32, u32),
+    rank: i8,
+    size: u64,
+    mtime: u64,
 }
 
 /// Build one segment file from docs (any order). Files that turn out not
@@ -417,15 +467,42 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             || Split { seen: vec![0u64; (1 << 24) / 64], buf: Vec::new(), flat: Vec::new(), syms: Vec::new(), docs: Vec::new() },
             |mut sp, i| {
                 sp.buf.clear();
-                let ok = open_regular(docs.path(i))
-                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
+                let (_, _, mut size, mut mtime) = docs.items[i];
+                let rank = match open_regular_checked(docs.path(i)) {
+                    Ok(mut f) => match f.metadata() {
+                        Ok(before) => {
+                            (size, mtime) = stamp(&before);
+                            match (&mut f).take(MAX_FILE + 1).read_to_end(&mut sp.buf) {
+                                Ok(n) if f.metadata().is_ok_and(|after| stamp(&after) == (size, mtime)) => {
+                                    if n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none() {
+                                        doc_rank(docs.path(i))
+                                    } else {
+                                        NOT_TEXT
+                                    }
+                                }
+                                // A partial read or an edit during the read
+                                // cannot establish a complete candidate set.
+                                _ => READ_FAILED,
+                            }
+                        }
+                        Err(_) => READ_FAILED,
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => NOT_TEXT,
+                    Err(_) => READ_FAILED,
+                };
                 let (start, sym) = (sp.flat.len() as u32, sp.syms.len() as u32);
-                if ok {
+                if rank > READ_FAILED {
                     trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
                     symbols(&sp.buf, &mut sp.syms);
                 }
-                sp.docs.push((i, start, sp.flat.len() as u32 - start, ok, sym, sp.syms.len() as u32 - sym));
+                sp.docs.push(BuiltDoc {
+                    input: i,
+                    trigrams: (start, sp.flat.len() as u32 - start),
+                    symbols: (sym, sp.syms.len() as u32 - sym),
+                    rank,
+                    size,
+                    mtime,
+                });
                 sp
             },
         )
@@ -440,19 +517,18 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     let meta: Vec<DocMeta> = order
         .iter()
         .map(|&(si, k)| {
-            let (i, _, _, text, _, _) = splits[si].docs[k];
-            let (_, _, size, mtime) = docs.items[i];
-            DocMeta { path: docs.path(i), size, mtime, rank: if text { doc_rank(docs.path(i)) } else { NOT_TEXT } }
+            let d = &splits[si].docs[k];
+            DocMeta { path: docs.path(d.input), size: d.size, mtime: d.mtime, rank: d.rank }
         })
         .collect();
     let tris = |d: usize| {
         let (si, k) = order[d];
-        let (_, st, len, _, _, _) = splits[si].docs[k];
+        let (st, len) = splits[si].docs[k].trigrams;
         &splits[si].flat[st as usize..(st + len) as usize]
     };
     let syms = |d: usize| {
         let (si, k) = order[d];
-        let (_, _, _, _, st, len) = splits[si].docs[k];
+        let (st, len) = splits[si].docs[k].symbols;
         &splits[si].syms[st as usize..(st + len) as usize]
     };
     // Definition keys sort after every trigram (they're above 2^24), so they
@@ -529,7 +605,7 @@ pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
         for d in 0..s.ndocs as u32 {
             if !s.is_dead(d) {
                 r[d as usize] = meta.len() as u32;
-                meta.push(DocMeta { path: s.path(d), size: s.size()[d as usize], mtime: s.mtime()[d as usize], rank: s.rank()[d as usize] });
+                meta.push(DocMeta { path: s.path(d), size: s.size()[d as usize], mtime: s.precise_mtime(d as usize), rank: s.rank()[d as usize] });
             }
         }
         remap.push(r);
@@ -592,7 +668,8 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
         path_off.push(paths.len() as u32);
     }
     let size: Vec<u64> = docs.iter().map(|d| d.size).collect();
-    let mtime: Vec<u32> = docs.iter().map(|d| d.mtime).collect();
+    let mtime: Vec<u32> = docs.iter().map(|d| mtime_seconds(d.mtime)).collect();
+    let mtime_nsec: Vec<u32> = docs.iter().map(|d| (d.mtime % NANOS) as u32).collect();
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(docs[b as usize].path));
@@ -609,6 +686,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
         as_bytes(&mtime),
         as_bytes(&by_path),
         as_bytes(&rank),
+        as_bytes(&mtime_nsec),
     ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
@@ -744,7 +822,13 @@ impl Content {
                 let ids = if recursive { s.with_prefix(&lo).collect::<Vec<_>>() } else { s.direct_children(&lo) };
                 for d in ids {
                     match want.find(s.path(d)) {
-                        Some(i) if want.items[i].2 == s.size()[d as usize] && want.items[i].3 == s.mtime()[d as usize] => held[i] = true,
+                        Some(i)
+                            if want.items[i].2 == s.size()[d as usize]
+                                && want.items[i].3 == s.precise_mtime(d as usize)
+                                && s.rank()[d as usize] != READ_FAILED =>
+                        {
+                            held[i] = true
+                        }
                         _ => touched[si] |= s.kill(d),
                     }
                 }
@@ -752,7 +836,7 @@ impl Content {
             for (i, h) in held.iter().enumerate() {
                 if !h {
                     let (_, _, size, mtime) = want.items[i];
-                    todo.push(want.path(i), size, mtime);
+                    todo.push_stamp(want.path(i), size, mtime);
                 }
             }
         }
@@ -775,13 +859,35 @@ impl Content {
             self.segs
                 .par_iter()
                 .flat_map_iter(|s| (0..s.ndocs as u32).filter(|&d| !s.is_dead(d)).map(move |d| (s, d)))
-                .filter(|&(s, d)| crate::live::lstat(s.path(d)).is_none_or(|o| o.mtime >= since || o.size != s.size()[d as usize]))
+                .filter(|&(s, d)| {
+                    disk_stamp(s.path(d)).is_none_or(|(size, mtime)| {
+                        mtime_seconds(mtime) >= since || size != s.size()[d as usize] || mtime != s.precise_mtime(d as usize)
+                    })
+                })
                 .map(|(s, d)| {
                     let p = s.path(d);
                     p[..p.iter().rposition(|&b| b == b'/').unwrap_or(0).max(1)].to_vec()
                 })
                 .collect()
         });
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Failed reads alone need a retry even if no filesystem event follows.
+    /// No disk probing here: only inspect the persisted failure state.
+    pub fn retry_dirs(&self) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = self
+            .segs
+            .iter()
+            .flat_map(|s| (0..s.ndocs as u32).map(move |d| (s, d)))
+            .filter(|&(s, d)| !s.is_dead(d) && s.rank()[d as usize] == READ_FAILED)
+            .map(|(s, d)| {
+                let p = s.path(d);
+                p[..p.iter().rposition(|&b| b == b'/').unwrap_or(0).max(1)].to_vec()
+            })
+            .collect();
         out.sort();
         out.dedup();
         out
@@ -843,7 +949,7 @@ impl Content {
             .flat_map_iter(|(si, s)| {
                 let ids = eval(s, plan).unwrap_or_else(|| (0..s.ndocs as u32).collect());
                 ids.into_iter()
-                    .filter(move |&d| !s.is_dead(d) && s.rank()[d as usize] != NOT_TEXT)
+                    .filter(move |&d| !s.is_dead(d) && s.rank()[d as usize] > READ_FAILED)
                     .filter(move |&d| filt.match_path(s.path(d), KIND_FILE, s.size()[d as usize], s.mtime()[d as usize]).is_some())
                     .map(move |d| (si, d))
                     .collect::<Vec<_>>()
@@ -852,7 +958,7 @@ impl Content {
         // Your files before dot-dirs/logs, then most recently modified first.
         out.sort_by_key(|&(si, d)| {
             let s = &self.segs[si];
-            std::cmp::Reverse((s.rank()[d as usize], s.mtime()[d as usize]))
+            std::cmp::Reverse((s.rank()[d as usize], s.precise_mtime(d as usize)))
         });
         out
     }
@@ -867,6 +973,12 @@ impl Content {
 /// What the name index says should be indexed under `dir` (direct
 /// children only unless `recursive`).
 pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
+    let mut want = wanted_names(live, home, dir, recursive);
+    want.refresh_stamps();
+    want
+}
+
+fn wanted_names(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
     let mut want = Docs::default();
     if !in_scope(dir, home) {
         return want;
@@ -886,7 +998,7 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
             }
             // Direct children share `dir`, already in scope.
             if !recursive || file_in_scope(&p, home) {
-                want.push(&p, idx.size_of(i), idx.mtime()[i]);
+                want.push_stamp(&p, idx.size_of(i), idx.mtime()[i] as u64 * NANOS);
             }
         }
     }
@@ -898,7 +1010,7 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
             if direct { name_ok(&k[k.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..], o.size) } else { eligible(k, o.size, home) }
         };
         if o.kind & 3 == KIND_FILE && (recursive || direct) && ok(k) {
-            want.push(k, o.size, o.mtime);
+            want.push_stamp(k, o.size, o.mtime as u64 * NANOS);
         }
     }
     want
@@ -924,8 +1036,18 @@ pub(crate) fn follows(path: &[u8], tree: bool, home: &[u8]) -> bool {
 }
 
 /// The dirs/trees from one batch of changes, each with what should be
-/// indexed there. Done under the name-index read lock only.
+/// indexed there and its precise current disk metadata.
 pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> Vec<(Vec<u8>, bool, Docs)> {
+    let mut out = wants_names(live, home, dirs, trees);
+    for (_, _, docs) in &mut out {
+        docs.refresh_stamps();
+    }
+    out
+}
+
+/// Collect only the name snapshot under the name-index lock. The engine
+/// refreshes disk stamps after releasing that lock, before diffing.
+pub(crate) fn wants_names(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> Vec<(Vec<u8>, bool, Docs)> {
     let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
         out.extend(follow_target(d, r, home));
@@ -934,7 +1056,7 @@ pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> V
     out.dedup();
     out.into_iter()
         .map(|(d, r)| {
-            let mut w = wanted(live, home, &d, r);
+            let mut w = wanted_names(live, home, &d, r);
             w.sort();
             (d, r, w)
         })
@@ -1328,11 +1450,12 @@ fn info(h: &Hir) -> Info {
                         Info { exact: Some(set), q: and(cur.q, n.q) }
                     }
                     (a, b) => {
-                        let q = and(and(cur.q, exact_query(a)), n.q);
-                        match b {
-                            Some(b) if b.len() <= MAX_EXACT => Info { exact: Some(b), q },
-                            b => Info { exact: None, q: and(q, exact_query(b)) },
-                        }
+                        // Exactness describes the whole fragment. Once a
+                        // concat is inexact, its literal suffix is only a
+                        // requirement; a surrounding capture cannot append
+                        // it to a prefix as though they were adjacent.
+                        let q = and(and(cur.q, exact_query(a)), and(n.q, exact_query(b)));
+                        Info { exact: None, q }
                     }
                 };
             }
@@ -1388,10 +1511,14 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
 /// "don't materialize dataless files" policy keeps iCloud placeholders from
 /// being downloaded just because we searched.
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
+    open_regular_checked(path).ok()
+}
+
+fn open_regular_checked(path: &[u8]) -> std::io::Result<std::fs::File> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
-    f.metadata().ok()?.is_file().then_some(f)
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path))?;
+    if f.metadata()?.is_file() { Ok(f) } else { Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")) }
 }
 
 #[cfg(test)]
@@ -1803,6 +1930,20 @@ mod tests {
     }
 
     #[test]
+    fn regression_captured_inexact_regex_keeps_all_valid_matches() {
+        let root = scratch("captured-inexact");
+        let (c, paths) = index(&root, &[("a.txt", b"prefixfooXbar\n"), ("b.txt", b"prefixquxYbaz\n"), ("c.txt", b"prefixfooXbarend\n")]);
+        for pattern in ["prefix(foo.*bar)", "prefix(foo.+bar)", "prefix(foo.*bar|qux.*baz)", "prefix(foo.*bar)end"] {
+            let g = grep(pattern, GrepMode::Regex);
+            let direct = verify(&g, &paths, 100);
+            assert!(!direct.files.is_empty(), "each fixture must exercise a valid match: {pattern}");
+            let indexed = c.search(&g, &q(""));
+            assert_eq!(indexed.files.len(), direct.files.len(), "valid matches must remain candidates: {pattern}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn regex_plans() {
         let plan = |re: &str| regex_plan(&regex_syntax::Parser::new().parse(re).unwrap());
         let tri = |s: &[u8]| (fold(s[0]) as u32) << 16 | (fold(s[1]) as u32) << 8 | fold(s[2]) as u32;
@@ -2015,9 +2156,11 @@ mod tests {
         assert!(rejects(&good[..good.len() - 64]), "truncated");
         assert!(rejects(&good[..10]), "truncated header");
         assert!(rejects(b""), "empty");
-        let mut bad = good.clone();
-        bad[..8].copy_from_slice(b"FSCSEG02");
-        assert!(rejects(&bad), "old magic");
+        for magic in [b"FSCSEG02", b"FSCSEG03"] {
+            let mut bad = good.clone();
+            bad[..8].copy_from_slice(magic);
+            assert!(rejects(&bad), "old magic");
+        }
         // Absurd header counts must not overflow or allocate their way in.
         for k in 0..4 {
             for v in [u64::MAX, u64::MAX / 4, 1 << 40] {
@@ -2066,6 +2209,29 @@ mod tests {
         assert!(empty.segs.is_empty());
         assert_eq!(empty.alloc_id(), 1);
         assert_eq!(empty.docs(), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regression_previous_content_cache_format_is_rebuilt() {
+        let root = scratch("cache-migration");
+        let home = root.as_os_str().as_bytes();
+        let (c, paths) = index(&root, &[("f.txt", b"needle\n")]);
+        let dir = c.dir.clone();
+        let old = seg_path(&dir, c.segs[0].id);
+        drop(c);
+        let mut bytes = std::fs::read(&old).unwrap();
+        bytes[..8].copy_from_slice(b"FSCSEG03");
+        std::fs::write(&old, bytes).unwrap();
+        let mut c = Content::open(dir.clone());
+        assert_eq!(c.docs(), 0, "coarse timestamps cannot establish current content freshness");
+        assert!(!old.exists(), "discard the obsolete segment before rebuilding");
+        let docs = c.diff(vec![want(home, true, &paths)]);
+        assert_eq!(docs.len(), 1, "startup's home sync rebuilds the old cache");
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        drop(c);
+        assert_eq!(names(&Content::open(dir), "needle", GrepMode::Literal), ["f.txt"]);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2124,6 +2290,75 @@ mod tests {
         assert_eq!(todo.len(), 0);
         assert_eq!(c.docs(), 1);
         assert_eq!(names(&c, "four", GrepMode::Literal), ["four.txt"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regression_subsecond_content_edit_survives_merge_and_reopen() {
+        use std::fs::{File, FileTimes};
+        use std::time::UNIX_EPOCH;
+        let root = scratch("subsecond-edit");
+        let path = put(&root, "f.txt", b"alpha\n");
+        let set_modified = |nsec| {
+            File::options()
+                .write(true)
+                .open(os(&path))
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::new(1_700_000_000, nsec)))
+                .unwrap();
+        };
+        set_modified(100_000_000);
+        let home = root.as_os_str().as_bytes();
+        let mut live = Live::new(Index::build(vec![Listing { id: 0, names: vec![], ents: vec![] }], 0, 0, home));
+        live.over.insert(path.clone(), crate::live::lstat(&path).unwrap());
+        let mut c = Content::open(root.join("idx"));
+        let docs = c.diff(wants(&live, home, &[], &[home.to_vec()]));
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        // Merge and disk reopen must retain the original precise timestamp.
+        let ids = c.segs.iter().map(|s| s.id).collect::<Vec<_>>();
+        let id = c.alloc_id();
+        let merged = merge(&c.dir, id, &c.segments(&ids)).unwrap();
+        c.replace(&ids, merged);
+        let dir = c.dir.clone();
+        drop(c);
+        let mut c = Content::open(dir);
+        assert!(c.diff(wants(&live, home, &[], &[home.to_vec()])).is_empty());
+        std::fs::write(os(&path), b"bravo\n").unwrap();
+        set_modified(200_000_000);
+        live.over.insert(path.clone(), crate::live::lstat(&path).unwrap());
+        assert_eq!(c.changed_dirs(u32::MAX), [home], "recovery sees subsecond edits even when their seconds precede the recovery window");
+        let todo = c.diff(wants(&live, home, &[], &[home.to_vec()]));
+        assert_eq!(todo.len(), 1, "same size and seconds still need a fresh content index");
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &todo, 0..todo.len()).unwrap());
+        assert_eq!(names(&c, "bravo", GrepMode::Literal), ["f.txt"]);
+        assert!(c.diff(wants(&live, home, &[], &[home.to_vec()])).is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regression_transient_read_failure_is_retried_with_unchanged_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("read-retry");
+        let path = put(&root, "f.txt", b"needle\n");
+        let docs = docs_of(std::slice::from_ref(&path));
+        std::fs::set_permissions(os(&path), std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(open_regular(&path).is_none(), "fixture must actually deny the read");
+        let mut c = Content::open(root.join("idx"));
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        // Failed reads must survive reopen with their retry state intact.
+        let dir = c.dir.clone();
+        drop(c);
+        let mut c = Content::open(dir);
+        std::fs::set_permissions(os(&path), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let todo = c.diff(vec![want(root.as_os_str().as_bytes(), true, std::slice::from_ref(&path))]);
+        assert_eq!(todo.len(), 1, "a read failure does not establish that the file is nontext");
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &todo, 0..todo.len()).unwrap());
+        assert_eq!(names(&c, "needle", GrepMode::Literal), ["f.txt"]);
+        assert!(c.diff(vec![want(root.as_os_str().as_bytes(), true, &[path])]).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

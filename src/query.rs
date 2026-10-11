@@ -52,8 +52,8 @@ fn takes_typos(text: &[u8], mode: Mode) -> bool {
 pub struct Query {
     pub tokens: Vec<Token>,
     pub kind: Option<u8>,
-    /// `type:app`: a folder kind also takes symlinks, since the system apps
-    /// in /Applications link into the cryptex (/Applications/Safari.app).
+    /// `type:app`: .app alternatives take folders and symlinks, since the
+    /// system apps link into the cryptex (/Applications/Safari.app).
     pub apps: bool,
     pub exts: Vec<Vec<u8>>,
     pub scope: Option<Vec<u8>>,
@@ -175,7 +175,7 @@ impl Query {
                 // A bare age is that whole unit, like `find -mtime`:
                 // mtime:3d is 3 to 4 days ago, mtime:2h 2 to 3 hours.
                 if !v.contains(['<', '>']) && !v.contains("..") {
-                    hi = hi.saturating_add(parse_age(&format!("1{}", split_unit(v).1)).unwrap_or(0));
+                    hi = hi.saturating_add(parse_age(&format!("1{}", split_unit(v).1)).map_or(0, |n| n.floor));
                 }
                 self.mtime = (now.saturating_sub(hi.min(now as u64) as u32), now.saturating_sub(lo.min(now as u64) as u32));
                 if hi == u64::MAX {
@@ -189,6 +189,12 @@ impl Query {
             "regex" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Regex),
             "sym" | "symbol" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Symbol),
             _ => return Ok(false),
+        }
+        // Other extension alternatives keep their usual kinds; the app
+        // requirement applies only to .app. A later explicit kind clears
+        // `apps`, and therefore still overrides the whole type filter.
+        if self.apps && self.exts.iter().any(|e| e != b"app") {
+            self.kind = None;
         }
         Ok(true)
     }
@@ -204,6 +210,14 @@ impl Query {
             None => true,
             Some(want) => kind & 3 == want || (self.apps && want == KIND_DIR && kind & 3 == KIND_LINK),
         }
+    }
+
+    #[inline(always)]
+    fn app_kind_ok(&self, name: &[u8], kind: u8) -> bool {
+        !self.apps
+            || self.kind.is_some()
+            || matches!(kind & 3, KIND_DIR | KIND_LINK)
+            || !(name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".app"))
     }
 
     /// Does a full path pass every filter and token? Returns the match score.
@@ -224,6 +238,7 @@ impl Query {
         let name = &path[cut + 1..];
         if name.is_empty()
             || !self.kind_ok(kind)
+            || !self.app_kind_ok(name, kind)
             || (!self.exts.is_empty() && !ext_ok(name, &self.exts))
             || size < self.size.0
             || size > self.size.1
@@ -307,52 +322,99 @@ fn split_words(s: &str) -> Vec<String> {
     out
 }
 
-fn range(v: &str, p: fn(&str) -> Option<u64>) -> Result<(u64, u64), String> {
+fn range(v: &str, p: fn(&str) -> Option<Quantity>) -> Result<(u64, u64), String> {
     let bad = || format!("bad range {v}");
-    if let Some(r) = v.strip_prefix(">=").or(v.strip_prefix('>')) {
-        return Ok((p(r).ok_or_else(bad)?, u64::MAX));
+    if let Some(r) = v.strip_prefix(">=") {
+        return Ok(p(r).ok_or_else(bad)?.ceil().map_or((1, 0), |lo| (lo, u64::MAX)));
     }
-    if let Some(r) = v.strip_prefix("<=").or(v.strip_prefix('<')) {
-        return Ok((0, p(r).ok_or_else(bad)?));
+    if let Some(r) = v.strip_prefix('>') {
+        let n = p(r).ok_or_else(bad)?;
+        return Ok(if n.overflow { None } else { n.floor.checked_add(1) }.map_or((1, 0), |lo| (lo, u64::MAX)));
+    }
+    if let Some(r) = v.strip_prefix("<=") {
+        return Ok((0, p(r).ok_or_else(bad)?.floor));
+    }
+    if let Some(r) = v.strip_prefix('<') {
+        let n = p(r).ok_or_else(bad)?;
+        return Ok(if n.overflow || n.fractional { Some(n.floor) } else { n.floor.checked_sub(1) }.map_or((1, 0), |hi| (0, hi)));
     }
     if let Some((a, b)) = v.split_once("..") {
-        return Ok((p(a).ok_or_else(bad)?, p(b).ok_or_else(bad)?));
+        return Ok((p(a).ok_or_else(bad)?.floor, p(b).ok_or_else(bad)?.floor));
     }
-    let x = p(v).ok_or_else(bad)?;
+    let x = p(v).ok_or_else(bad)?.floor;
     Ok((x, x))
 }
 
-fn split_unit(s: &str) -> (f64, String) {
+fn split_unit(s: &str) -> (&str, String) {
     let i = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
-    (s[..i].parse().unwrap_or(f64::NAN), s[i..].to_ascii_lowercase())
+    (&s[..i], s[i..].to_ascii_lowercase())
 }
 
-fn parse_size(s: &str) -> Option<u64> {
-    let (n, u) = split_unit(s);
-    let m = match u.as_str() {
-        "" | "b" => 1.0,
-        "k" | "kb" => 1e3,
-        "m" | "mb" => 1e6,
-        "g" | "gb" => 1e9,
-        "t" | "tb" => 1e12,
-        _ => return None,
-    };
-    (!n.is_nan()).then_some((n * m) as u64)
+/// A decimal threshold in integer bytes or seconds, retaining the fractional
+/// remainder so integer comparison bounds can round in the right direction.
+struct Quantity {
+    floor: u64,
+    fractional: bool,
+    overflow: bool,
 }
 
-fn parse_age(s: &str) -> Option<u64> {
+impl Quantity {
+    fn ceil(&self) -> Option<u64> {
+        if self.overflow { None } else { self.floor.checked_add(self.fractional as u64) }
+    }
+}
+
+fn scaled_decimal(s: &str, unit: u64) -> Option<Quantity> {
+    let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
+    if (whole.is_empty() && fraction.is_empty()) || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (mut n, mut overflow) = (0u64, false);
+    for b in whole.bytes() {
+        match n.checked_mul(10).and_then(|n| n.checked_add((b - b'0') as u64)) {
+            Some(v) => n = v,
+            None => (n, overflow) = (u64::MAX, true),
+        }
+    }
+    // Decimal multiplication from the final fractional digit carries the
+    // exact whole-unit contribution leftward. Even arbitrarily long tails
+    // need only a carry smaller than `unit`, and never round through f64.
+    let (mut carry, mut fractional) = (0u64, false);
+    for b in fraction.bytes().rev() {
+        let v = (b - b'0') as u128 * unit as u128 + carry as u128;
+        fractional |= !v.is_multiple_of(10);
+        carry = (v / 10) as u64;
+    }
+    let floor = n.checked_mul(unit).and_then(|n| n.checked_add(carry));
+    Some(Quantity { floor: floor.unwrap_or(u64::MAX), fractional, overflow: overflow || floor.is_none() })
+}
+
+fn parse_size(s: &str) -> Option<Quantity> {
     let (n, u) = split_unit(s);
     let m = match u.as_str() {
-        "s" => 1.0,
-        "m" | "min" => 60.0,
-        "h" => 3600.0,
-        "" | "d" => 86400.0,
-        "w" => 604800.0,
-        "mo" => 2592000.0,
-        "y" => 31536000.0,
+        "" | "b" => 1,
+        "k" | "kb" => 1000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "t" | "tb" => 1_000_000_000_000,
         _ => return None,
     };
-    (!n.is_nan()).then_some((n * m) as u64)
+    scaled_decimal(n, m)
+}
+
+fn parse_age(s: &str) -> Option<Quantity> {
+    let (n, u) = split_unit(s);
+    let m = match u.as_str() {
+        "s" => 1,
+        "m" | "min" => 60,
+        "h" => 3600,
+        "" | "d" => 86400,
+        "w" => 604800,
+        "mo" => 2592000,
+        "y" => 31536000,
+        _ => return None,
+    };
+    scaled_decimal(n, m)
 }
 
 pub fn now_secs() -> u32 {
@@ -939,7 +1001,7 @@ impl Scan<'_> {
         let idx = &self.live.base;
         let q = self.q;
         let k = idx.kind()[i];
-        if !q.kind_ok(k) {
+        if !q.kind_ok(k) || (q.apps && !q.app_kind_ok(idx.name(i), k)) {
             return None;
         }
         if q.size != (0, u64::MAX) {
@@ -1506,13 +1568,144 @@ mod tests {
     #[test]
     fn ranges() {
         assert_eq!(range("5", parse_size), Ok((5, 5)));
-        assert_eq!(range(">5", parse_size), Ok((5, u64::MAX)));
+        assert_eq!(range(">5", parse_size), Ok((6, u64::MAX)));
         assert_eq!(range(">=5", parse_size), Ok((5, u64::MAX)));
-        assert_eq!(range("<5", parse_size), Ok((0, 5)));
+        assert_eq!(range("<5", parse_size), Ok((0, 4)));
         assert_eq!(range("<=5", parse_size), Ok((0, 5)));
         assert_eq!(range("1k..2k", parse_size), Ok((1000, 2000)));
         assert!(range("1k..", parse_size).is_err());
         assert!(range("..1k", parse_size).is_err());
+    }
+
+    #[test]
+    fn audit_strict_size_bounds() {
+        let l = live(&[("/four", F, 4, OLD), ("/five", F, 5, OLD), ("/six", F, 6, OLD)]);
+        for (s, expected) in
+            [("size:>5", vec!["/six"]), ("size:<5", vec!["/four"]), ("size:>=5", vec!["/five", "/six"]), ("size:<=5", vec!["/five", "/four"])]
+        {
+            let mut got = find(&l, s);
+            got.sort();
+            assert_eq!(got, expected, "{s}");
+            for size in [4, 5, 6] {
+                let want = match s {
+                    "size:>5" => size > 5,
+                    "size:<5" => size < 5,
+                    "size:>=5" => size >= 5,
+                    _ => size <= 5,
+                };
+                assert_eq!(q(s).match_path(b"/file", F, size, OLD).is_some(), want, "{s}, size {size}");
+            }
+        }
+        // An impossible strict bound must stay empty, without overflow or
+        // saturation turning it into a match at the endpoint.
+        for s in ["size:<0", "size:>18446744073709551615", "size:>99999999999999999999999t"] {
+            let p = q(s);
+            for size in [0, 1, u64::MAX - 1, u64::MAX] {
+                assert!(p.match_path(b"/file", F, size, OLD).is_none(), "{s}, size {size}");
+            }
+        }
+        assert!(q("size:>=18446744073709551615").match_path(b"/file", F, u64::MAX, OLD).is_some());
+        assert!(q("size:<=0").match_path(b"/file", F, 0, OLD).is_some());
+        for (s, size, want) in [
+            ("size:>18446744073709551614", u64::MAX - 1, false),
+            ("size:>18446744073709551614", u64::MAX, true),
+            ("size:<18446744073709551615", u64::MAX - 1, true),
+            ("size:<18446744073709551615", u64::MAX, false),
+            ("size:<=18446744073709551614", u64::MAX, false),
+        ] {
+            assert_eq!(q(s).match_path(b"/file", F, size, OLD).is_some(), want, "{s}, size {size}");
+        }
+    }
+
+    #[test]
+    fn review_fractional_size_bounds() {
+        let l = live(&[("/zero", F, 0, OLD), ("/one", F, 1, OLD), ("/two", F, 2, OLD)]);
+        for (s, expected) in [
+            ("<1.5", (0, 1)),
+            ("<=1.5", (0, 1)),
+            (">1.5", (2, u64::MAX)),
+            (">=1.5", (2, u64::MAX)),
+            ("<0.5", (0, 0)),
+            ("<=0.5", (0, 0)),
+            (">0.5", (1, u64::MAX)),
+            (">=0.5", (1, u64::MAX)),
+            (">=1.001kb", (1001, u64::MAX)),
+            (">1.001kb", (1002, u64::MAX)),
+            ("<1.001kb", (0, 1000)),
+            ("<=1.001kb", (0, 1001)),
+            ("<0.00000000000000000001b", (0, 0)),
+            (">=0.00000000000000000001b", (1, u64::MAX)),
+            ("<18446744073709551615.5", (0, u64::MAX)),
+            (">=18446744073709551615.5", (1, 0)),
+            (">18446744073709551614.5", (u64::MAX, u64::MAX)),
+            (">=18446744073709551614.5", (u64::MAX, u64::MAX)),
+            ("<=18446744073709551614.5", (0, u64::MAX - 1)),
+            ("<18446744073709551616", (0, u64::MAX)),
+            (">=18446744073709551616", (1, 0)),
+        ] {
+            let p = q(&format!("size:{s}"));
+            assert_eq!(p.size, expected, "{s}");
+            for size in [0, 1, 2, 1000, 1001, 1002, u64::MAX - 1, u64::MAX] {
+                assert_eq!(p.match_path(b"/file", F, size, OLD).is_some(), size >= expected.0 && size <= expected.1, "{s}, size {size}");
+            }
+        }
+        let mut got = find(&l, "size:<1.5");
+        got.sort();
+        assert_eq!(got, ["/one", "/zero"]);
+        assert_eq!(find(&l, "size:>=1.5"), ["/two"]);
+    }
+
+    #[test]
+    fn review_fractional_age_bounds() {
+        for (s, expected) in [
+            ("<0.5s", (0, 0)),
+            ("<=0.5s", (0, 0)),
+            (">0.5s", (1, u64::MAX)),
+            (">=0.5s", (1, u64::MAX)),
+            ("<1.5s", (0, 1)),
+            ("<=1.5s", (0, 1)),
+            (">1.5s", (2, u64::MAX)),
+            (">=1.5s", (2, u64::MAX)),
+            (">=0.01666666666666666667m", (2, u64::MAX)),
+            ("<0.01666666666666666667m", (0, 1)),
+            (">=0.01666666666666666666m", (1, u64::MAX)),
+            ("<0.01666666666666666666m", (0, 0)),
+        ] {
+            assert_eq!(range(s, parse_age), Ok(expected), "{s}");
+        }
+        for s in ["mtime:<0.5s", "mtime:<=0.5s"] {
+            let before = now_secs();
+            let p = q(s);
+            let after = now_secs();
+            assert_eq!(p.mtime.0, p.mtime.1, "{s}");
+            assert!((before..=after).contains(&p.mtime.1), "{s}");
+            assert!(p.match_path(b"/file", F, 0, p.mtime.1).is_some(), "{s}");
+        }
+        for s in ["mtime:>0.5s", "mtime:>=0.5s"] {
+            let before = now_secs();
+            let p = q(s);
+            let after = now_secs();
+            assert_eq!(p.mtime.0, 0, "{s}");
+            assert!((before - 1..=after - 1).contains(&p.mtime.1), "{s}");
+        }
+    }
+
+    #[test]
+    fn strict_age_bounds_preserve_units_and_inclusive_ranges() {
+        // Age ranges use seconds, and invert when converted to mtime.
+        let recent = q("mtime:<5s");
+        assert_eq!(recent.mtime.1 - recent.mtime.0, 4);
+        let inclusive = q("mtime:<=5s");
+        assert_eq!(inclusive.mtime.1 - inclusive.mtime.0, 5);
+        let before = now_secs();
+        let older = q("mtime:>5s");
+        let after = now_secs();
+        assert_eq!(older.mtime.0, 0);
+        assert!((before - 6..=after - 6).contains(&older.mtime.1));
+        let p = q("mtime:<0s");
+        assert!(p.mtime.0 > p.mtime.1);
+        let p = q("mtime:>99999999999999999999999y");
+        assert!(p.mtime.0 > p.mtime.1);
     }
 
     #[test]
@@ -1531,15 +1724,15 @@ mod tests {
             ("1tb", 1_000_000_000_000),
             (".5k", 500),
         ] {
-            assert_eq!(parse_size(s), Some(n), "{s}");
+            assert_eq!(parse_size(s).map(|n| n.floor), Some(n), "{s}");
         }
         // Out of range saturates rather than wrapping.
-        assert_eq!(parse_size("99999999999999999999999t"), Some(u64::MAX));
+        assert_eq!(parse_size("99999999999999999999999t").map(|n| n.floor), Some(u64::MAX));
         for s in ["", "k", "-1", "1x", "inf", "nan", "1.2.3"] {
-            assert_eq!(parse_size(s), None, "{s}");
+            assert!(parse_size(s).is_none(), "{s}");
         }
         let p = q("size:>1mb");
-        assert_eq!(p.size, (1_000_000, u64::MAX));
+        assert_eq!(p.size, (1_000_001, u64::MAX));
     }
 
     #[test]
@@ -1556,10 +1749,10 @@ mod tests {
             ("1y", 31536000),
             ("1.5h", 5400),
         ] {
-            assert_eq!(parse_age(s), Some(n), "{s}");
+            assert_eq!(parse_age(s).map(|n| n.floor), Some(n), "{s}");
         }
-        assert_eq!(parse_age("1x"), None);
-        assert_eq!(parse_age("d"), None);
+        assert!(parse_age("1x").is_none());
+        assert!(parse_age("d").is_none());
     }
 
     #[test]
@@ -1591,6 +1784,33 @@ mod tests {
         assert!(!q("type:app kind:dir").kind_ok(KIND_LINK));
         assert!(q("kind:dir type:app").kind_ok(KIND_LINK));
         assert!(!q("type:app kind:link").kind_ok(KIND_DIR));
+    }
+
+    #[test]
+    fn audit_mixed_app_types_match_regular_files() {
+        let l = live(&[("/photo.png", F, 1, OLD), ("/Foo.app", D, 0, OLD), ("/Linked.app", KIND_LINK, 0, OLD), ("/plain.app", F, 1, OLD)]);
+        for s in ["type:app,image", "type:image,app", "type:app type:image", "type:image type:app"] {
+            let mut got = find(&l, s);
+            got.sort();
+            assert_eq!(got, ["/Foo.app", "/Linked.app", "/photo.png"], "{s}");
+            let p = q(s);
+            assert!(p.match_path(b"/photo.png", F, 1, OLD).is_some(), "{s}");
+            assert!(p.match_path(b"/Foo.app", D, 0, OLD).is_some(), "{s}");
+            assert!(p.match_path(b"/Linked.app", KIND_LINK, 0, OLD).is_some(), "{s}");
+            assert!(p.match_path(b"/plain.app", F, 1, OLD).is_none(), "{s}");
+        }
+        // An explicit kind after the union still selects that kind alone.
+        for (s, expected) in [
+            ("type:app,image kind:file", vec!["/photo.png", "/plain.app"]),
+            ("type:image,app kind:dir", vec!["/Foo.app"]),
+            ("type:image,app kind:link", vec!["/Linked.app"]),
+        ] {
+            let mut got = find(&l, s);
+            got.sort();
+            assert_eq!(got, expected, "{s}");
+        }
+        assert_eq!(find(&l, "type:app kind:dir"), ["/Foo.app"]);
+        assert_eq!(find(&l, "kind:file type:app,image").len(), 3);
     }
 
     /// No `<`/`>`: that whole unit, like `find -mtime 3` (3 to 4 days ago).

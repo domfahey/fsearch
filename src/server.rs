@@ -85,10 +85,11 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
         }
         // Read every time: a new holder writes its pid only after taking the
         // lock, so until then the file may name a crashed daemon's pid, now
-        // ours or a stranger's. Only a daemon (`fsearch serve`) is signalled.
+        // ours or a stranger's, even another daemon's. Only a daemon
+        // (`fsearch serve`) with this lock file open is signalled.
         let pid = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|&p| p > 1);
         named = pid.or(named);
-        if let Some(p) = pid.filter(|&p| p != me && killed != Some(p) && is_fsearch(p) && is_daemon(p)) {
+        if let Some(p) = pid.filter(|&p| p != me && killed != Some(p) && is_fsearch(p) && is_daemon(p) && holders(&path).contains(&p)) {
             unsafe { libc::kill(p, libc::SIGTERM) };
             killed = Some(p);
         }
@@ -111,7 +112,9 @@ fn stop_within(dir: &Path, timeout: Duration) -> Result<(), String> {
             format!("socket.lock holds a stale pid ({me}, this process); the daemon holding the lock never recorded its own: stop it by hand")
         }
         (None, Some(p)) => {
-            format!("socket.lock holds a stale pid ({p}, not an fsearch daemon); the daemon holding the lock never recorded its own: stop it by hand")
+            format!(
+                "socket.lock holds a stale pid ({p}, not the daemon for this directory); the daemon holding the lock never recorded its own: stop it by hand"
+            )
         }
         (None, None) => "a daemon is running but did not record its pid; stop it by hand".into(),
     })
@@ -660,6 +663,31 @@ mod tests {
         assert_eq!(r, Ok(()));
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(c.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    /// A stale pid can name another fsearch daemon. Its executable and
+    /// command line match, but it holds a different data directory's lock.
+    #[test]
+    fn stop_never_signals_a_daemon_for_another_directory() {
+        let dir = root().join("stop-other-daemon");
+        let other = root().join("stop-other-daemon-stranger");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let path = dir.join("socket.lock");
+        let mut stranger = holder(&other.join("socket.lock"));
+        std::fs::write(&path, stranger.id().to_string()).unwrap();
+        let mut c = spawn_holder(&path, 400);
+        wait_for("the new holder's lock", || !try_lock(&std::fs::File::open(&path).unwrap()));
+        let r = stop_within(&dir, Duration::from_secs(5));
+        let alive = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = c.kill();
+        use std::os::unix::process::ExitStatusExt;
+        let signal = c.wait().unwrap().signal();
+        assert!(alive, "signalled the daemon for another data directory");
+        assert_eq!(r, Ok(()));
+        assert_eq!(signal, Some(libc::SIGTERM));
     }
 
     /// A daemon from before pids were recorded holds the lock with an empty
