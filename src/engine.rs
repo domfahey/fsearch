@@ -25,6 +25,8 @@ const COMPACT_EVERY: Duration = Duration::from_secs(12 * 3600);
 const SCAN_THREADS: usize = 8;
 const CONTENT_QUIET: Duration = Duration::from_secs(2);
 const CONTENT_MAX_WAIT: Duration = Duration::from_secs(300);
+const CONTENT_RETRY: Duration = Duration::from_secs(300);
+type ContentPending = HashMap<(Vec<u8>, bool), (Instant, Instant)>;
 /// How often a follower checks whether it can take over or reload.
 const FOLLOW_EVERY: Duration = Duration::from_secs(10);
 /// Seconds before the last known-good moment that a relist also covers.
@@ -494,6 +496,18 @@ pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
 }
 
+fn content_retries(content: &Content, pending: &mut ContentPending, last_retry: &mut Instant, now: Instant) {
+    if now.duration_since(*last_retry) < CONTENT_RETRY {
+        return;
+    }
+    *last_retry = now;
+    for dir in content.retry_dirs() {
+        // Existing filesystem churn retains its debounce. An otherwise
+        // idle failed directory is ripe immediately, once per interval.
+        pending.entry((dir, false)).or_insert((now - CONTENT_QUIET, now - CONTENT_QUIET));
+    }
+}
+
 fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
@@ -511,9 +525,10 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
     // or 5 min after its first pending one if it never goes quiet. A file you
     // save lands in ~2s; files apps rewrite every second (state, logs) cost
     // one reindex per 5 min instead of one per event batch.
-    let mut pending: HashMap<(Vec<u8>, bool), (Instant, Instant)> = HashMap::new();
+    let mut pending = ContentPending::new();
+    let mut last_retry = Instant::now();
     loop {
-        let wait = if pending.is_empty() { Duration::from_secs(3600) } else { Duration::from_millis(250) };
+        let wait = if pending.is_empty() { CONTENT_RETRY.saturating_sub(last_retry.elapsed()) } else { Duration::from_millis(250) };
         match rx.recv_timeout(wait) {
             Ok(first) => {
                 let now = Instant::now();
@@ -529,6 +544,7 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
+        content_retries(&shared.content.read().unwrap(), &mut pending, &mut last_retry, Instant::now());
         let ripe: Vec<(Vec<u8>, bool)> = pending
             .iter()
             .filter(|(_, (first, last))| last.elapsed() >= CONTENT_QUIET || first.elapsed() >= CONTENT_MAX_WAIT)
@@ -543,11 +559,16 @@ fn content_loop(shared: &Shared, rx: Receiver<Resync>) {
             if k.1 { trees.push(k.0) } else { dirs.push(k.0) }
         }
         let t = Instant::now();
-        let wants = {
+        let mut wants = {
             let g = shared.live.read().unwrap();
             let Some(live) = g.as_ref() else { continue };
-            content::wants(live, &home, &dirs, &trees)
+            content::wants_names(live, &home, &dirs, &trees)
         };
+        // Precise per-file stats can be slow on a cold home tree; keep
+        // them outside the name lock so searches and event updates proceed.
+        for (_, _, docs) in &mut wants {
+            docs.refresh_stamps();
+        }
         let todo = shared.content.write().unwrap().diff(wants);
         if todo.is_empty() {
             continue;
@@ -814,6 +835,58 @@ pub fn default_dir(home: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_content_retry_is_bounded_and_targets_failed_directories() {
+        use crate::walk::{KIND_FILE, Listing};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root().join("content-retry");
+        std::fs::create_dir_all(dir.join("failed")).unwrap();
+        std::fs::create_dir_all(dir.join("healthy")).unwrap();
+        std::fs::create_dir_all(dir.join("binary")).unwrap();
+        let file = dir.join("failed/f.txt");
+        std::fs::write(&file, "needle").unwrap();
+        std::fs::write(dir.join("healthy/h.txt"), "healthy").unwrap();
+        std::fs::write(dir.join("binary/b.txt"), b"\0binary").unwrap();
+        let home = dir.as_os_str().as_bytes();
+        let mut live = Live::new(Index::build(vec![Listing { id: 0, names: vec![], ents: vec![] }], 0, 0, home));
+        for path in [&file, &dir.join("healthy/h.txt"), &dir.join("binary/b.txt")] {
+            let path = path.as_os_str().as_bytes().to_vec();
+            live.over.insert(path.clone(), crate::live::OEnt::new(&path, KIND_FILE, 6, 0));
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(content::open_regular(file.as_os_str().as_bytes()).is_none());
+        let mut c = Content::open(dir.join("index"));
+        let docs = content::wanted(&live, home, home, true);
+        let id = c.alloc_id();
+        c.push(content::build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let start = Instant::now();
+        let mut last = start;
+        let mut pending = ContentPending::new();
+        content_retries(&c, &mut pending, &mut last, start + CONTENT_RETRY - Duration::from_secs(1));
+        assert!(pending.is_empty(), "failed reads must not trigger a busy retry loop");
+        let now = start + CONTENT_RETRY;
+        content_retries(&c, &mut pending, &mut last, now);
+        let failed = dir.join("failed").as_os_str().as_bytes().to_vec();
+        assert_eq!(pending.len(), 1, "healthy and genuinely binary files need no retry");
+        assert_eq!(pending[&(failed.clone(), false)], (now - CONTENT_QUIET, now - CONTENT_QUIET));
+        assert_eq!(last, now);
+        pending.clear();
+        content_retries(&c, &mut pending, &mut last, now + Duration::from_secs(1));
+        assert!(pending.is_empty(), "each scheduled round is separated by the retry interval");
+        let event = now + CONTENT_RETRY;
+        pending.insert((failed.clone(), false), (event, event));
+        content_retries(&c, &mut pending, &mut last, event);
+        assert_eq!(pending[&(failed.clone(), false)], (event, event), "retry scheduling retains active event debounce");
+        let docs = c.diff(content::wants(&live, home, &[failed], &[]));
+        let id = c.alloc_id();
+        c.push(content::build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        pending.clear();
+        content_retries(&c, &mut pending, &mut last, event + CONTENT_RETRY);
+        assert!(pending.is_empty(), "a successful read removes its background retry state");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// What `scan_root` indexes here: set without `env::set_var`, which is
     /// unsound while other test threads run.
