@@ -419,7 +419,7 @@ impl Index {
                 let p = dp[k] as usize;
                 p < k && ds[p] <= de[k] && de[k] < dend[p] && dend[k] <= dend[p]
             })
-            && (0..self.d).into_par_iter().all(|k| de[k] < ds[k].max(1) && ds[k] as u64 + dl[k] as u64 <= dend[k] as u64)
+            && (0..self.d).into_par_iter().all(|k| de[k] < ds[k] && ds[k] as u64 + dl[k] as u64 <= dend[k] as u64)
             && (1..self.n).into_par_iter().all(|i| (de[par[i] as usize] as usize) < i)
     }
 
@@ -930,6 +930,25 @@ pub(crate) mod tests {
         b[at + 8..at + 12].copy_from_slice(&de[1].to_ne_bytes());
         std::fs::write(&sp, b).unwrap();
         assert!(Index::load(&sp).is_none(), "folder entries out of order");
+    }
+
+    #[test]
+    fn audit_root_cannot_be_its_own_child() {
+        let t = Tmp::new("idx-root-child");
+        // Both a root with children and an empty root are valid caches.
+        for (n, idx) in [sample(), Index::build(vec![lst(0, &[])], 0, 0, b"")].into_iter().enumerate() {
+            let path = t.p(&format!("root-{n}.bin"));
+            idx.save(&path).unwrap();
+            assert!(Index::load(&path).is_some());
+            assert_eq!(idx.dir_start()[0], 1);
+            // Including entry 0 in its own children lets memo_plan requeue
+            // the root forever. Reject at load without traversing the cycle.
+            let at = idx.dir_start().as_ptr() as usize - idx.map.as_ptr() as usize;
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[at..at + 4].copy_from_slice(&0u32.to_ne_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            assert!(Index::load(&path).is_none(), "root start 0 was accepted in fixture {n}");
+        }
     }
 
     /// A corrupt index whose parent links loop must not recurse forever: a
