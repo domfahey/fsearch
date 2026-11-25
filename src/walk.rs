@@ -65,10 +65,15 @@ const PRUNE_MIN: usize = 1024;
 
 /// `p` as an absolute normalized path: `~` and bare names are home-relative.
 pub(crate) fn expand(p: &[u8], home: &[u8]) -> Vec<u8> {
-    let p = match p.strip_prefix(b"~") {
-        Some(rest) => [home, rest].concat(),
-        None if p.starts_with(b"/") => p.to_vec(),
-        None => crate::live::join(home, p),
+    let home = crate::live::normalize(home);
+    let p = if p == b"~" {
+        home
+    } else if let Some(rest) = p.strip_prefix(b"~/") {
+        crate::live::join(&home, rest)
+    } else if p.starts_with(b"/") {
+        p.to_vec()
+    } else {
+        crate::live::join(&home, p)
     };
     crate::live::normalize(&p)
 }
@@ -290,6 +295,9 @@ struct Ctx {
     out: Vec<Mutex<Vec<Listing>>>,
     /// The whole-disk crawl: counts LISTED, yields to searches.
     disk: bool,
+    has_skip: bool,
+    #[cfg(test)]
+    fast_empty: AtomicUsize,
 }
 
 thread_local! {
@@ -307,11 +315,17 @@ pub fn scan_disk(threads: usize) -> Vec<Listing> {
 }
 
 fn scan_with(root: &[u8], threads: usize, disk: bool) -> Vec<Listing> {
+    scan_opts(root, threads, disk, SKIP.get().is_some()).0
+}
+
+fn scan_opts(root: &[u8], threads: usize, disk: bool, has_skip: bool) -> (Vec<Listing>, usize) {
     raise_fd_limit();
-    let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
+    let threads = threads.max(1);
+    let root = crate::live::normalize(root);
+    let fd = if blocked(&root) { -1 } else { CString::new(root.as_slice()).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip or to learn
     // (a CACHEDIR.TAG needs its folder's path).
-    let path = (SKIP.get().is_some() || LAZY.get().is_some()).then(|| root.to_vec());
+    let path = (has_skip || LAZY.get().is_some_and(|s| s.cache_dirs)).then_some(root);
     let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
     if fd >= 0 {
         if disk {
@@ -332,24 +346,38 @@ fn scan_with(root: &[u8], threads: usize, disk: bool) -> Vec<Listing> {
         if disk {
             LISTED.fetch_add(l.ents.len(), Ordering::Relaxed);
         }
-        return vec![l];
+        return (vec![l], 0);
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
-    let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(), disk };
+    let ctx = Ctx {
+        next_id: AtomicU32::new(1),
+        out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect(),
+        disk,
+        has_skip,
+        #[cfg(test)]
+        fast_empty: AtomicUsize::new(0),
+    };
     pool.scope(|s| descend(s, fd, path, l, &ctx));
+    #[cfg(test)]
+    let fast_empty = ctx.fast_empty.load(Ordering::Relaxed);
+    #[cfg(not(test))]
+    let fast_empty = 0;
     let parts: Vec<Vec<Listing>> = ctx.out.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
     for p in parts {
         out.extend(p);
     }
-    out
+    (out, fast_empty)
 }
 
 fn raise_fd_limit() {
-    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
-    r.rlim_cur = r.rlim_max.min(65536);
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
+        r.rlim_cur = r.rlim_cur.max(r.rlim_max.min(65536));
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+    });
 }
 
 /// List a single directory (no recursion). Subdirectories come back with
@@ -424,8 +452,11 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
             }
             e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
             let name = CString::new(name).unwrap_or_default();
-            // (With paths tracked, opening is how refusals get recorded.)
-            if maybe_empty && child_path.is_none() && entry_count(fd, &name) == Some(0) {
+            // (With SKIP set, opening is how EPERM refusals get recorded.)
+            if maybe_empty && !ctx.has_skip && entry_count(fd, &name) == Some(0) {
+                #[cfg(test)]
+                ctx.fast_empty.fetch_add(1, Ordering::Relaxed);
+                learn_cachedir(child_path.as_deref(), &Listing::default());
                 empty.push(e.child);
             } else {
                 kids.push((name, e.child, child_path));
@@ -440,9 +471,11 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
         let parent = me.clone();
         s.spawn(move |s| {
             let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
+            // Capture errno before `drop(parent)` may invoke `libc::close`.
+            let err = (fd < 0).then(|| std::io::Error::last_os_error().raw_os_error()).flatten();
             drop(parent);
             if fd < 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                && should_record_denied(ctx.has_skip, err, child_path.as_deref())
                 && let Some(p) = &child_path
             {
                 DENIED.lock().unwrap().push(p.clone());
@@ -452,6 +485,10 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
     }
 }
 
+fn should_record_denied(has_skip: bool, err: Option<i32>, child_path: Option<&[u8]>) -> bool {
+    has_skip && err == Some(libc::EPERM) && child_path.is_some()
+}
+
 /// Entries in the directory `name` (in `dir`) resolves to.
 fn entry_count(dir: i32, name: &CString) -> Option<u32> {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
@@ -459,7 +496,7 @@ fn entry_count(dir: i32, name: &CString) -> Option<u32> {
     al.dirattr = libc::ATTR_DIR_ENTRYCOUNT;
     let mut b = [0u32; 2];
     let r = unsafe { libc::getattrlistat(dir, name.as_ptr(), (&raw mut al).cast(), b.as_mut_ptr().cast(), 8, libc::FSOPT_NOFOLLOW as _) };
-    (r == 0).then_some(b[1])
+    (r == 0 && b[0] >= 8).then_some(b[1])
 }
 
 /// Is the folder at `path` a mount point, as a listing of its parent flags
@@ -471,7 +508,7 @@ pub fn is_mount(path: &[u8]) -> bool {
     al.dirattr = libc::ATTR_DIR_MOUNTSTATUS;
     let mut b = [0u32; 2];
     let r = unsafe { libc::getattrlist(c.as_ptr(), (&raw mut al).cast(), b.as_mut_ptr().cast(), 8, libc::FSOPT_NOFOLLOW as _) };
-    r == 0 && b[1] & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0
+    r == 0 && b[0] >= 8 && b[1] & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0
 }
 
 fn push(l: Listing, ctx: &Ctx) {
@@ -512,6 +549,9 @@ fn list_fd(fd: i32, l: &mut Listing) {
     BUF.with_borrow_mut(|buf| {
         loop {
             let n = unsafe { libc::getattrlistbulk(fd, &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
             if n <= 0 {
                 break;
             }
@@ -838,5 +878,72 @@ mod tests {
         };
         assert_eq!(s.unit(b"/foo/bar"), Some(4));
         assert_eq!(s.unit(b"/"), Some(1));
+    }
+
+    /// With `LAZY` set and `has_skip = false`, empty subdirs take the fast
+    /// path (and any emptied former CACHEDIR.TAG folder is forgotten).
+    #[test]
+    fn empty_fast_path_runs_with_lazy_and_no_skip() {
+        let _ = LAZY.set(LazyDirs::build(b"/h", false));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-empty-fast-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let empty = root.join("empty");
+        let full = root.join("full");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("f"), b"x").unwrap();
+
+        let empty_b = empty.to_str().unwrap().as_bytes().to_vec();
+        LAZY.get().unwrap().cachedir.write().unwrap().insert(empty_b.clone());
+
+        let r = root.to_str().unwrap().as_bytes();
+        let (_ls, fast_empty) = scan_opts(r, 2, false, false);
+        assert_eq!(fast_empty, 1, "empty subdir should use fast path when has_skip is false");
+        assert!(!LAZY.get().unwrap().cachedir.read().unwrap().contains(&empty_b), "emptied CACHEDIR dir should be forgotten");
+
+        let (_ls, fast_empty_skip) = scan_opts(r, 2, false, true);
+        assert_eq!(fast_empty_skip, 0, "empty subdir must still be opened when has_skip is true");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `DENIED` is only recorded while `SKIP` is set (`has_skip == true`).
+    #[test]
+    fn denied_not_recorded_without_skip() {
+        assert!(!should_record_denied(false, Some(libc::EPERM), Some(b"/some/path")));
+        assert!(should_record_denied(true, Some(libc::EPERM), Some(b"/some/path")));
+        assert!(!should_record_denied(true, Some(libc::EACCES), Some(b"/some/path")));
+        assert!(!should_record_denied(true, Some(libc::EPERM), None));
+    }
+
+    /// `expand` handles `home == b"/"` without introducing a double slash.
+    #[test]
+    fn expand_handles_root_home() {
+        assert_eq!(expand(b"~/.cache", b"/"), b"/.cache");
+        assert_eq!(expand(b"~", b"/"), b"/");
+        assert_eq!(expand(b"~/", b"/"), b"/");
+        assert_eq!(expand(b"~/.cache", b"/home/u"), b"/home/u/.cache");
+        assert_eq!(expand(b"~", b"/home/u"), b"/home/u");
+        assert_eq!(expand(b"~/", b"/home/u"), b"/home/u");
+        assert_eq!(LazyDirs::build(b"/", false).unit(b"/.cache/foo/bar"), Some(b"/.cache/foo".len()));
+    }
+
+    /// `scan(root, 0)` does not panic with 0 threads, and a trailing slash on
+    /// `root` is normalized so learned `CACHEDIR.TAG` paths have no `//`.
+    #[test]
+    fn scan_zero_threads_and_trailing_slash_root() {
+        let _ = LAZY.set(LazyDirs::build(b"/h", false));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-walk-zero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("CACHEDIR.TAG"), b"tag").unwrap();
+        let with_slash = [root.to_str().unwrap().as_bytes(), b"/"].concat();
+        let ls = scan(&with_slash, 0);
+        let sub_norm = sub.to_str().unwrap().as_bytes().to_vec();
+        let has_norm = LAZY.get().unwrap().cachedir.read().unwrap().contains(&sub_norm);
+        LAZY.get().unwrap().cachedir.write().unwrap().remove(&sub_norm);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(ls.len() >= 2);
+        assert!(has_norm, "trailing slash on scan root produced unnormalized cachedir path");
     }
 }
