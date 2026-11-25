@@ -107,6 +107,7 @@ pub fn current_id() -> u64 {
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
     fn dispatch_queue_attr_make_with_qos_class(attr: *const c_void, qos: u32, relative_priority: i32) -> *const c_void;
+    fn dispatch_release(object: *mut c_void);
 }
 
 extern "C" fn on_events(_s: *mut c_void, info: *mut c_void, n: usize, paths: *mut c_void, flags: *const u32, ids: *const u64) {
@@ -179,6 +180,7 @@ pub fn watch(since: u64, tx: Sender<Vec<Event>>, stream: u32, ours: &[u8]) -> St
         let qos = libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32;
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
         (a.set_queue)(s, q);
+        dispatch_release(q);
         (a.start)(s);
         Stream(s)
     }
