@@ -177,17 +177,18 @@ impl Live {
     }
 
     fn drop_over_subtree(&mut self, path: &[u8]) {
-        self.priors.remove(path);
         if let Some(o) = self.over.remove(path) {
             self.flat.clear(o);
         }
         let (lo, hi) = subtree_bounds(path);
-        let keys: Vec<Vec<u8>> = self.over.range(lo..hi).map(|(k, _)| k.clone()).collect();
+        let keys: Vec<Vec<u8>> = self.over.range::<Vec<u8>, _>(&lo..&hi).map(|(k, _)| k.clone()).collect();
         for k in keys {
-            self.priors.remove(&k);
             if let Some(o) = self.over.remove(&k) {
                 self.flat.clear(o);
             }
+        }
+        if !self.priors.is_empty() {
+            self.priors.retain(|k, _| k.as_slice() != path && !(k.as_slice() >= lo.as_slice() && k.as_slice() < hi.as_slice()));
         }
     }
 
@@ -217,8 +218,9 @@ impl Live {
     pub fn fetch(&self, path: &[u8], recursive: bool) -> Fetched {
         let p = normalize(path);
         let mut f = Fetched { path: p, recursive, blocked: false, attrs: None, listing: None, scans: HashMap::new() };
-        // Not even an lstat inside folders we may not touch.
-        if walk::blocked(&f.path) {
+        // Reject empty/relative paths (which would otherwise resolve to root)
+        // and never even lstat inside folders we may not touch.
+        if !f.path.starts_with(b"/") || walk::blocked(&f.path) {
             f.blocked = true;
             return f;
         }
@@ -376,7 +378,9 @@ impl Live {
                         self.kill_subtree(c as u32);
                         let scan = f.scans.remove(&child);
                         self.add_new(child, now, scan);
-                    } else if now.kind & 3 != KIND_DIR && (self.base.size_raw(c) != enc_size(now.size) || self.base.mtime(c) != now.mtime) {
+                    } else if now.kind & 3 != KIND_DIR
+                        && (was_kind != now.kind || self.base.size_raw(c) != enc_size(now.size) || self.base.mtime(c) != now.mtime)
+                    {
                         self.kill(c as u32);
                         self.put(child, now);
                     }
@@ -453,7 +457,10 @@ impl Live {
             (1..idx.d)
                 .into_par_iter()
                 .with_min_len(1024)
-                .filter(|&k| !self.is_dead(de.get(k)))
+                .filter(|&k| {
+                    let e = de.get(k);
+                    !self.is_dead(e) && idx.kind(e as usize) & FLAG_MOUNT == 0
+                })
                 .map_init(Vec::new, |buf, k| {
                     idx.path(de.get(k) as usize, buf);
                     check(buf).then(|| buf.clone())
@@ -576,12 +583,15 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
     if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
         return None;
     }
-    let kind = match st.st_mode & libc::S_IFMT {
+    let mut kind = match st.st_mode & libc::S_IFMT {
         libc::S_IFREG => walk::KIND_FILE,
         libc::S_IFDIR => KIND_DIR,
         libc::S_IFLNK => walk::KIND_LINK,
         _ => walk::KIND_OTHER,
     };
+    if st.st_flags & libc::UF_HIDDEN != 0 {
+        kind |= walk::FLAG_HIDDEN;
+    }
     Some(OEnt::new(path, kind, st.st_size as u64, st.st_mtime.clamp(0, u32::MAX as i64) as u32))
 }
 
@@ -821,5 +831,73 @@ mod tests {
         assert!(live.base_alive(&locked_bytes).is_some(), "unreadable dir was wiped");
         assert!(live.base_alive(&join(&locked_bytes, b"keep.txt")).is_some(), "child of unreadable dir was wiped");
         assert!(live.trees.is_empty(), "unreadable dir emitted tree resync");
+    }
+
+    /// An empty or relative path must never resolve to root and wipe the index.
+    #[test]
+    fn empty_and_relative_paths_do_not_wipe_index() {
+        let ent = RawEnt { name_off: 0, name_len: 1, kind: walk::KIND_FILE, size: 1, mtime: 1, child: NONE };
+        let mut live = Live::new(Index::build(vec![Listing { id: 0, names: b"a".to_vec(), ents: vec![ent] }], 0, 0, b"/h"));
+        live.put(b"/b".to_vec(), OEnt::new(b"b", walk::KIND_FILE, 1, 1));
+        live.apply_dir(b"", false);
+        live.apply_dir(b"a", false);
+        assert_eq!(live.dead_count, 0, "empty/relative path killed base entries");
+        assert!(live.over.contains_key(b"/b".as_slice()), "empty/relative path wiped overlay");
+    }
+
+    /// `lstat` preserves `UF_HIDDEN` as `FLAG_HIDDEN`, and `apply` updates a
+    /// base file when its flags change even if size and mtime do not.
+    #[test]
+    fn lstat_and_base_update_preserve_hidden_flag() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let f = d.join("secret.txt");
+        std::fs::write(&f, "x").unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let fp = f.as_os_str().as_encoded_bytes().to_vec();
+        let mut live = Live::new(base_for(&root));
+        let c = std::ffi::CString::new(fp.as_slice()).unwrap();
+        assert_eq!(unsafe { libc::chflags(c.as_ptr(), libc::UF_HIDDEN) }, 0);
+        let st = lstat(&fp).unwrap();
+        live.apply_dir(&root, false);
+        let _ = unsafe { libc::chflags(c.as_ptr(), 0) };
+        let _ = std::fs::remove_dir_all(&d);
+        assert_ne!(st.kind & walk::FLAG_HIDDEN, 0, "lstat dropped FLAG_HIDDEN");
+        assert!(live.over.get(&fp).is_some_and(|o| o.kind & walk::FLAG_HIDDEN != 0), "apply ignored FLAG_HIDDEN change on base file");
+    }
+
+    /// Removing or dropping a subtree prunes orphaned intermediate dir keys
+    /// from `Live::priors` without affecting sibling prefixes.
+    #[test]
+    fn priors_pruned_on_remove_path_and_drop_over_subtree() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-priors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub/nested")).unwrap();
+        std::fs::write(d.join("sub/nested/a.txt"), "x").unwrap();
+        std::fs::create_dir_all(d.join("sub2")).unwrap();
+        std::fs::create_dir_all(d.join("keep")).unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let mut live = Live::new(base_for(&root));
+        let _ = std::fs::remove_dir_all(&d);
+
+        live.put(join(&root, b"sub/c.txt"), OEnt::new(b"c.txt", walk::KIND_FILE, 1, 1));
+        live.put(join(&root, b"sub/nested/b.txt"), OEnt::new(b"b.txt", walk::KIND_FILE, 1, 1));
+        live.put(join(&root, b"sub2/x.txt"), OEnt::new(b"x.txt", walk::KIND_FILE, 1, 1));
+        live.put(join(&root, b"keep/x.txt"), OEnt::new(b"x.txt", walk::KIND_FILE, 1, 1));
+
+        assert!(live.priors.contains_key(&join(&root, b"sub")));
+        assert!(live.priors.contains_key(&join(&root, b"sub/nested")));
+        assert!(live.priors.contains_key(&join(&root, b"sub2")));
+        assert!(live.priors.contains_key(&join(&root, b"keep")));
+
+        live.remove_path(&join(&root, b"sub"));
+
+        assert!(!live.priors.contains_key(&join(&root, b"sub")), "sub remained in priors");
+        assert!(!live.priors.contains_key(&join(&root, b"sub/nested")), "sub/nested remained in priors");
+        assert!(live.priors.contains_key(&join(&root, b"sub2")), "sibling prefix sub2 was pruned");
+        assert!(live.priors.contains_key(&join(&root, b"keep")), "unrelated keep was pruned");
     }
 }
