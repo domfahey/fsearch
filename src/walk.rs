@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 
 pub const NONE: u32 = u32::MAX;
@@ -54,6 +54,8 @@ pub struct LazyDirs {
     pub cachedir: RwLock<HashSet<Vec<u8>>>,
     /// What `cachedir` held after its last prune.
     kept: AtomicUsize,
+    /// Prevents redundant concurrent `prune()` runs from crawl workers.
+    pruning: AtomicBool,
     /// CACHEDIR.TAG marking is on (off with the defaults).
     cache_dirs: bool,
 }
@@ -79,6 +81,7 @@ impl LazyDirs {
             names: if no_lazy { Vec::new() } else { LAZY_NAMES.iter().map(|n| n.as_bytes().to_vec()).collect() },
             cachedir: RwLock::new(HashSet::new()),
             kept: AtomicUsize::new(0),
+            pruning: AtomicBool::new(false),
             cache_dirs: !no_lazy,
         }
     }
@@ -92,8 +95,14 @@ impl LazyDirs {
     /// an index rather than crawling, and listings are the only other way
     /// a tagged folder is learned.
     pub fn seed(&self, idx: &crate::index::Index) {
+        self.seed_with(idx, blocked);
+    }
+
+    fn seed_with(&self, idx: &crate::index::Index, is_blocked: impl Fn(&[u8]) -> bool) {
         if self.cache_dirs {
-            self.cachedir.write().unwrap().extend(idx.holding(CACHE_TAG));
+            let mut set = self.cachedir.write().unwrap();
+            set.extend(idx.holding(CACHE_TAG).into_iter().filter(|p| !is_blocked(p)));
+            self.kept.store(set.len(), Ordering::Relaxed);
         }
     }
 
@@ -101,13 +110,17 @@ impl LazyDirs {
     /// be forgotten, and compaction may be far off: once the set has
     /// doubled since the last prune it prunes itself.
     fn learn(&self, path: &[u8]) {
+        if self.cachedir.read().unwrap().contains(path) {
+            return;
+        }
         let n = {
             let mut set = self.cachedir.write().unwrap();
             set.insert(path.to_vec());
             set.len()
         };
-        if n > 2 * self.kept.load(Ordering::Relaxed).max(PRUNE_MIN) {
+        if n > 2 * self.kept.load(Ordering::Relaxed).max(PRUNE_MIN) && !self.pruning.swap(true, Ordering::AcqRel) {
             self.prune();
+            self.pruning.store(false, Ordering::Release);
         }
     }
 
@@ -115,11 +128,26 @@ impl LazyDirs {
     /// tag (or was deleted) stops being a lazy unit. Costly — compaction
     /// calls this, and `learn` as the set doubles.
     pub fn prune(&self) {
+        self.prune_with(blocked);
+    }
+
+    fn prune_with(&self, is_blocked: impl Fn(&[u8]) -> bool) {
+        // Snapshot under read lock so filesystem checks never hold the write lock.
+        let candidates: Vec<Vec<u8>> = self.cachedir.read().unwrap().iter().cloned().collect();
+        let drop: Vec<Vec<u8>> = candidates
+            .into_iter()
+            .filter(|p| {
+                if is_blocked(p) {
+                    return true;
+                }
+                let tag = crate::live::join(p, CACHE_TAG);
+                !std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(&tag)).is_ok_and(|m| m.is_file())
+            })
+            .collect();
         let mut set = self.cachedir.write().unwrap();
-        set.retain(|p| {
-            let tag = [p.as_slice(), b"/", CACHE_TAG].concat();
-            std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(&tag)).is_ok_and(|m| m.is_file())
-        });
+        for p in &drop {
+            set.remove(p);
+        }
         self.kept.store(set.len(), Ordering::Relaxed);
     }
 
@@ -129,13 +157,14 @@ impl LazyDirs {
     /// dir on the path.
     pub fn unit(&self, path: &[u8]) -> Option<usize> {
         for p in &self.prefixes {
-            if path.starts_with(p.as_slice()) && (path.len() == p.len() || path[p.len()] == b'/') {
+            if path.starts_with(p.as_slice()) && (p == b"/" || path.len() == p.len() || path[p.len()] == b'/') {
                 if path.len() == p.len() {
                     return Some(p.len());
                 }
-                let r = &path[p.len() + 1..];
+                let start = if p == b"/" { 1 } else { p.len() + 1 };
+                let r = &path[start..];
                 return Some(match r.iter().position(|&b| b == b'/') {
-                    Some(i) => p.len() + 1 + i,
+                    Some(i) => start + i,
                     None => path.len(),
                 });
             }
@@ -198,7 +227,7 @@ pub fn yield_to_searches() {
 }
 
 pub fn blocked(path: &[u8]) -> bool {
-    SKIP.get().is_some_and(|s| s.iter().any(|s| path.starts_with(s.as_slice()) && (path.len() == s.len() || path[s.len()] == b'/')))
+    SKIP.get().is_some_and(|s| s.iter().any(|s| path.starts_with(s.as_slice()) && (s == b"/" || path.len() == s.len() || path[s.len()] == b'/')))
 }
 
 /// A folder holding a regular file named CACHEDIR.TAG is a cache wherever
@@ -736,5 +765,78 @@ mod tests {
         s.prune();
         assert!(s.cachedir.read().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `seed_with` skips blocked folders and updates `kept` to the seeded count.
+    #[test]
+    fn seed_with_skips_blocked_and_updates_kept() {
+        let ent = |off: usize, len: usize, kind, child| RawEnt { name_off: off as u32, name_len: len as u16, kind, size: 0, mtime: 0, child };
+        let tag = CACHE_TAG.len();
+        let ls = vec![
+            Listing { id: 0, names: b"allowedblocked".to_vec(), ents: vec![ent(0, 7, KIND_DIR, 1), ent(7, 7, KIND_DIR, 2)] },
+            Listing { id: 1, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_FILE, NONE)] },
+            Listing { id: 2, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_FILE, NONE)] },
+        ];
+        let idx = crate::index::Index::build(ls, 0, 0, b"/h");
+        let s = LazyDirs::build(b"/h", false);
+        s.seed_with(&idx, |p| p.starts_with(b"/blocked"));
+        assert_eq!(*s.cachedir.read().unwrap(), HashSet::from([b"/allowed".to_vec()]));
+        assert_eq!(s.kept.load(Ordering::Relaxed), 1);
+    }
+
+    /// `prune_with` drops blocked folders even when their `CACHEDIR.TAG` exists
+    /// on disk (and without holding the write lock), and `prune` handles `/`.
+    #[test]
+    fn prune_with_drops_blocked_and_handles_root() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fsearch-prune-blocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let allowed = root.join("allowed");
+        let blocked_dir = root.join("blocked");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&blocked_dir).unwrap();
+        std::fs::write(allowed.join("CACHEDIR.TAG"), b"tag").unwrap();
+        std::fs::write(blocked_dir.join("CACHEDIR.TAG"), b"tag").unwrap();
+        let allowed_b = allowed.to_str().unwrap().as_bytes().to_vec();
+        let blocked_b = blocked_dir.to_str().unwrap().as_bytes().to_vec();
+
+        let s = LazyDirs::build(b"/h", false);
+        {
+            let mut set = s.cachedir.write().unwrap();
+            set.insert(allowed_b.clone());
+            set.insert(blocked_b.clone());
+            set.insert(b"/".to_vec());
+        }
+        let lock_free = std::sync::atomic::AtomicBool::new(true);
+        s.prune_with(|p| {
+            if s.cachedir.try_write().is_err() {
+                lock_free.store(false, Ordering::Relaxed);
+            }
+            p == blocked_b.as_slice()
+        });
+        assert!(lock_free.load(Ordering::Relaxed), "cachedir write lock held during prune check");
+        assert_eq!(*s.cachedir.read().unwrap(), HashSet::from([allowed_b.clone()]));
+        assert_eq!(s.kept.load(Ordering::Relaxed), 1);
+
+        // `prune` handles `p == b"/"` cleanly via `live::join`.
+        assert_eq!(crate::live::join(b"/", CACHE_TAG), b"/CACHEDIR.TAG");
+        s.cachedir.write().unwrap().insert(b"/".to_vec());
+        s.prune();
+        assert_eq!(*s.cachedir.read().unwrap(), HashSet::from([allowed_b]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `"/"` prefix matches all paths beneath `"/"` (not only `"/"` itself).
+    #[test]
+    fn prefix_root_matches_descendants() {
+        let s = LazyDirs {
+            prefixes: vec![b"/".to_vec()],
+            names: Vec::new(),
+            cachedir: RwLock::new(HashSet::new()),
+            kept: AtomicUsize::new(0),
+            pruning: AtomicBool::new(false),
+            cache_dirs: false,
+        };
+        assert_eq!(s.unit(b"/foo/bar"), Some(4));
+        assert_eq!(s.unit(b"/"), Some(1));
     }
 }
