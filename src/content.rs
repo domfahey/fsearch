@@ -3267,7 +3267,9 @@ pub fn grep_unindexed(g: &Grep, mut docs: Docs, filt: &Query) -> GrepResult {
     let mut order: Vec<(u64, u32)> = (0..docs.len())
         .filter_map(|i| {
             let (p, (_, _, size, mtime)) = (docs.path(i), docs.items[i]);
-            filt.match_path(p, KIND_FILE, size, mtime)?;
+            if size == 0 || filt.match_path(p, KIND_FILE, size, mtime).is_none() {
+                return None;
+            }
             Some((rank_key(doc_rank(p), mtime), i as u32))
         })
         .collect();
@@ -3803,7 +3805,7 @@ fn lines_at(g: &Grep, buf: &[u8], found: impl Iterator<Item = (usize, usize)>) -
             counted = start;
             ls = memchr::memrchr(b'\n', &buf[..start]).map_or(0, |p| p + 1);
             le = memchr::memchr(b'\n', &buf[start..]).map_or(buf.len(), |p| start + p);
-            raw = &buf[ls..le.min(ls + 400)];
+            raw = cap_line(&buf[ls..le]);
             let text = String::from_utf8_lossy(raw);
             utf8 = matches!(text, std::borrow::Cow::Borrowed(_));
             lines.push((line_no, text.trim_end().to_string()));
@@ -3823,6 +3825,17 @@ fn lines_at(g: &Grep, buf: &[u8], found: impl Iterator<Item = (usize, usize)>) -
     (lines, hits)
 }
 
+/// Byte width of the UTF-8 character starting at `b`, or 1 if not valid UTF-8.
+fn char_step(b: &[u8]) -> usize {
+    let s = &b[..b.len().min(4)];
+    let valid = std::str::from_utf8(s).map_or_else(|e| e.valid_up_to(), |s| s.len());
+    if valid > 0 {
+        std::str::from_utf8(&s[..valid]).unwrap().chars().next().map_or(1, char::len_utf8)
+    } else {
+        1
+    }
+}
+
 /// A regex's matches as ripgrep finds them, each within its line: the lines
 /// a match runs across are searched again one at a time. Past a final
 /// newline (or in an empty file) there is no line, so no match either.
@@ -3837,7 +3850,7 @@ fn on_lines<'a>(re: &'a Regex, buf: &'a [u8]) -> impl Iterator<Item = (usize, us
             let m = re.find_at(buf, at.min(buf.len())).filter(|_| at <= buf.len())?;
             // (As find_iter: no empty match where the last one ended.)
             if m.is_empty() && last == Some(m.end()) {
-                at += 1;
+                at += if at < buf.len() { char_step(&buf[at..]) } else { 1 };
                 continue;
             }
             if memchr::memchr(b'\n', m.as_bytes()).is_none() {
@@ -3857,9 +3870,34 @@ fn on_lines<'a>(re: &'a Regex, buf: &'a [u8]) -> impl Iterator<Item = (usize, us
     .take_while(move |m| m.0 < lines_end)
 }
 
-/// A line as shown: its first 400 bytes, trailing space trimmed.
+/// Prefix of `line` of at most 400 bytes, backing up off an incomplete
+/// trailing UTF-8 sequence when byte 400 falls inside a valid multi-byte char.
+fn cap_line(line: &[u8]) -> &[u8] {
+    if line.len() <= 400 {
+        return line;
+    }
+    let mut cut = 400;
+    if (line[cut] & 0xC0) == 0x80 {
+        let mut lead = cut - 1;
+        while lead > 0 && cut - lead < 3 && (line[lead] & 0xC0) == 0x80 {
+            lead -= 1;
+        }
+        let want = match line[lead] {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 0,
+        };
+        if lead + want > cut {
+            cut = lead;
+        }
+    }
+    &line[..cut]
+}
+
+/// A line as shown: its first 400 bytes (UTF-8-safe), trailing space trimmed.
 fn shown(line: &[u8]) -> String {
-    String::from_utf8_lossy(&line[..line.len().min(400)]).trim_end().to_string()
+    String::from_utf8_lossy(cap_line(line)).trim_end().to_string()
 }
 
 /// Up to `n` lines before the line starting at `ls`, in order.
@@ -4698,11 +4736,18 @@ fn regex_plan(h: &Hir) -> TQ {
 /// Files to grep where the content index does not reach (e.g. `in:/etc`),
 /// picked from the name index instead of crawling, newest first. `q` is the
 /// name query restricted to the files worth reading.
-pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
+pub fn scan_paths(live: &Live, q: Query) -> Vec<Vec<u8>> {
+    scan_paths_with(live, q, |live, q| crate::query::Searcher { live }.search(q))
+}
+
+fn scan_paths_with(live: &Live, mut q: Query, search: impl FnOnce(&Live, &Query) -> Vec<crate::query::Hit>) -> Vec<Vec<u8>> {
+    if q.size.0 > MAX_FILE {
+        return Vec::new();
+    }
     q.kind = Some(KIND_FILE);
     q.limit = 200_000;
     q.size = (q.size.0, q.size.1.min(MAX_FILE));
-    let mut files: Vec<(Vec<u8>, u32)> = (crate::query::Searcher { live }.search(&q).into_iter())
+    let mut files: Vec<(Vec<u8>, u32)> = (search(live, &q).into_iter())
         .map(|h| match h.over {
             Some(path) => {
                 let m = live.over[&path].mtime;
@@ -4978,5 +5023,100 @@ mod tests {
         assert_eq!(n_smart, 0);
         assert_eq!(n_sens, 1);
         assert!(matches!(Grep::with_case("MyFunc", GrepMode::Symbol, Case::Sensitive).unwrap().plan(), TQ::Tri(k) if k == symbol_key(b"MyFunc")));
+    }
+
+    /// `on_lines` steps past empty matches by UTF-8 char width, and
+    /// `grep_unindexed` skips 0-byte files like `Content::search_with`.
+    #[test]
+    fn on_lines_utf8_empty_match_and_grep_unindexed_zero_byte() {
+        let g = Grep::new("a*", GrepMode::Regex).unwrap();
+        let fm = matches_in(&g, b"/f", "é".as_bytes(), false).unwrap();
+        for &(a, b) in &fm.hits[0].ranges {
+            assert!("é".is_char_boundary(a) && "é".is_char_boundary(b), "bad range ({a}, {b})");
+        }
+
+        let d = std::env::temp_dir().join(format!("fsearch-unidx-zero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let p0 = d.join("empty.txt");
+        let p1 = d.join("ok.txt");
+        std::fs::write(&p0, b"").unwrap();
+        std::fs::write(&p1, b"ab\n").unwrap();
+        let mut docs = Docs::default();
+        docs.push(p0.as_os_str().as_bytes(), 0, 1);
+        docs.push(p1.as_os_str().as_bytes(), 3, 1);
+        let r = grep_unindexed(&g, docs, &Query::parse("", "/").unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(r.read, 1);
+        assert_eq!(r.files.len(), 1);
+        assert_eq!(r.files[0].path, p1.as_os_str().as_bytes());
+    }
+
+    /// `lines_at` and `shown` (before/after context) cap lines to 400 bytes
+    /// without splitting a multi-byte UTF-8 character across the boundary.
+    #[test]
+    fn utf8_safe_line_truncation_at_400_bytes() {
+        let check = |prefix_len: usize, ch: &str| {
+            let mut long = "a".repeat(prefix_len);
+            long.push_str(ch);
+            long.push_str("tail");
+            // Both as a matched line (`lines_at`) and as a context line (`shown`).
+            let g_hit = Grep::new("a", GrepMode::Literal).unwrap();
+            let fm_hit = matches_in(&g_hit, b"/f", long.as_bytes(), false).unwrap();
+            assert!(!fm_hit.lines[0].1.contains('\u{FFFD}'), "lines_at split {ch:?} at prefix {prefix_len}");
+
+            let mut buf = Vec::new();
+            buf.extend_from_slice(long.as_bytes());
+            buf.extend_from_slice(b"\nneedle\n");
+            buf.extend_from_slice(long.as_bytes());
+            let mut g_ctx = Grep::new("needle", GrepMode::Literal).unwrap();
+            g_ctx.before = 1;
+            g_ctx.after = 1;
+            let fm_ctx = matches_in(&g_ctx, b"/f", &buf, false).unwrap();
+            let hit = &fm_ctx.hits[0];
+            assert!(!hit.before[0].contains('\u{FFFD}'), "shown(before) split {ch:?} at prefix {prefix_len}");
+            assert!(!hit.after[0].contains('\u{FFFD}'), "shown(after) split {ch:?} at prefix {prefix_len}");
+            (fm_hit.lines[0].1.len(), hit.before[0].len(), hit.after[0].len())
+        };
+        // 2-byte straddling 400 (399..401), 3-byte (398..401, 399..402), 4-byte (397..401, 398..402, 399..403).
+        for (prefix, ch) in [(399, "é"), (398, "€"), (399, "€"), (397, "🦀"), (398, "🦀"), (399, "🦀")] {
+            assert_eq!(check(prefix, ch), (prefix, prefix, prefix));
+        }
+        // Valid 3-byte char ending right at byte 400 stays included.
+        assert_eq!(check(397, "€"), (400, 400, 400));
+        // Invalid continuation bytes don't underflow or back up more than 3 bytes.
+        let invalid = vec![0x80u8; 405];
+        assert_eq!(cap_line(&invalid).len(), 400);
+        assert_eq!(cap_line(&invalid[..400]).len(), 400);
+    }
+
+    /// `scan_paths` returns empty immediately without calling `Searcher` when
+    /// `q.size.0 > MAX_FILE`.
+    #[test]
+    fn scan_paths_skips_search_when_min_size_exceeds_max_file() {
+        let dir = |id: u32, name: &[u8], child: u32| Listing {
+            id,
+            names: name.to_vec(),
+            ents: vec![RawEnt { name_off: 0, name_len: name.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child }],
+        };
+        let ents = vec![RawEnt { name_off: 0, name_len: 7, kind: KIND_FILE, size: 3 << 20, mtime: 1, child: crate::walk::NONE }];
+        let idx = crate::index::Index::build(vec![dir(0, b"d", 1), Listing { id: 1, names: b"big.bin".to_vec(), ents }], 0, 0, b"/d");
+        let live = Live::new(idx);
+
+        let mut called = false;
+        let out = scan_paths_with(&live, Query::parse("size:>2mb", "/").unwrap(), |_, _| {
+            called = true;
+            Vec::new()
+        });
+        assert!(out.is_empty());
+        assert!(!called, "scan_paths called searcher with inverted size range");
+
+        let mut seen_size = None;
+        let _ = scan_paths_with(&live, Query::parse("size:<=2mb", "/").unwrap(), |_, q| {
+            seen_size = Some(q.size);
+            Vec::new()
+        });
+        assert_eq!(seen_size, Some((0, MAX_FILE)));
     }
 }
