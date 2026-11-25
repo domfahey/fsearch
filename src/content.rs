@@ -3284,10 +3284,26 @@ struct Probes {
     short: Vec<u32>,
 }
 
+fn is_cased_non_ascii(c: char) -> bool {
+    !c.is_ascii() && !c.to_lowercase().eq(c.to_uppercase())
+}
+
 /// Does the pattern hold a non-ASCII letter with another case (é, É)? A
 /// case-insensitive match may then hold other bytes for it.
 fn cased(pattern: &str) -> bool {
-    pattern.chars().any(|c| !c.is_ascii() && !c.to_lowercase().eq(c.to_uppercase()))
+    pattern.chars().any(is_cased_non_ascii)
+}
+
+/// Does the parsed regex `Hir` hold any non-ASCII letter with another case?
+fn hir_has_cased_non_ascii(h: &Hir) -> bool {
+    match h.kind() {
+        HirKind::Empty | HirKind::Look(_) | HirKind::Class(Class::Bytes(_)) => false,
+        HirKind::Literal(l) => String::from_utf8_lossy(&l.0).chars().any(is_cased_non_ascii),
+        HirKind::Class(Class::Unicode(u)) => u.ranges().iter().any(|r| (r.start().max('\u{80}')..=r.end()).any(is_cased_non_ascii)),
+        HirKind::Capture(c) => hir_has_cased_non_ascii(&c.sub),
+        HirKind::Repetition(r) => hir_has_cased_non_ascii(&r.sub),
+        HirKind::Concat(hs) | HirKind::Alternation(hs) => hs.iter().any(hir_has_cased_non_ascii),
+    }
 }
 
 /// How a pattern's letter case matters.
@@ -3460,16 +3476,19 @@ impl Grep {
     }
 
     fn plan(&self) -> TQ {
-        let q = match self.mode {
+        let (q, non_ascii) = match self.mode {
             // Exactly the docs that define it (plus rare hash collisions,
             // which reading the file weeds out).
-            GrepMode::Symbol if plain_identifier(self.pattern.as_bytes()) => return TQ::Tri(symbol_key(self.pattern.as_bytes())),
-            GrepMode::Literal | GrepMode::Symbol => literal_plan(self.pattern.as_bytes()),
-            GrepMode::Regex => regex_syntax::Parser::new().parse(&self.pattern).map_or(TQ::All, |h| regex_plan(&h)),
+            GrepMode::Symbol if !self.case_insensitive && plain_identifier(self.pattern.as_bytes()) => return TQ::Tri(symbol_key(self.pattern.as_bytes())),
+            GrepMode::Literal | GrepMode::Symbol => (literal_plan(self.pattern.as_bytes()), cased(&self.pattern)),
+            GrepMode::Regex => match regex_syntax::Parser::new().parse(&self.pattern) {
+                Ok(h) => (regex_plan(&h), self.case_insensitive && hir_has_cased_non_ascii(&h)),
+                Err(_) => (TQ::All, false),
+            },
         };
         // The index folds ASCII only: a non-ASCII letter's other case is
         // other bytes.
-        if self.case_insensitive && cased(&self.pattern) { ascii_only(q) } else { q }
+        if self.case_insensitive && non_ascii { ascii_only(q) } else { q }
     }
 }
 
@@ -4003,8 +4022,14 @@ fn ascii_only(q: TQ) -> TQ {
     match q {
         TQ::Tri(t) if t < 1 << 24 && t.to_be_bytes()[1..].iter().any(|&b| b >= 0x80) => TQ::All,
         TQ::Pair(p) if p.to_be_bytes()[1..3].iter().any(|&b| b >= 0x80) => TQ::All,
-        TQ::And(v) => TQ::And(v.into_iter().map(ascii_only).collect()),
-        TQ::Or(v) => TQ::Or(v.into_iter().map(ascii_only).collect()),
+        TQ::And(v) => {
+            let v: Vec<TQ> = v.into_iter().map(ascii_only).filter(|x| !matches!(x, TQ::All)).collect();
+            if v.is_empty() { TQ::All } else { TQ::And(v) }
+        }
+        TQ::Or(v) => {
+            let v: Vec<TQ> = v.into_iter().map(ascii_only).collect();
+            if v.iter().any(|x| matches!(x, TQ::All)) { TQ::All } else { TQ::Or(v) }
+        }
         q => q,
     }
 }
@@ -4473,6 +4498,9 @@ fn eval(s: &Segment, q: &TQ, docs: std::ops::Range<u32>) -> Option<Vec<u32>> {
             acc
         }
         TQ::Or(qs) => {
+            if qs.iter().any(|q| matches!(q, TQ::All)) {
+                return None;
+            }
             let mut acc: Vec<u32> = Vec::new();
             for q in qs {
                 acc.extend(eval(s, q, docs.clone())?);
@@ -4881,5 +4909,74 @@ mod tests {
         let seg = Segment::load(&d, 1);
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(seg.unwrap().live_docs, 0);
+    }
+
+    /// Case-insensitive regexes with non-ASCII escapes trigger `ascii_only`,
+    /// and `ascii_only` simplifies `And`/`Or` with `TQ::All`.
+    #[test]
+    fn non_ascii_regex_escape_case_insensitive_index_and_ascii_only() {
+        let d = std::env::temp_dir().join(format!("fsearch-esc-fold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let mut docs = Docs::default();
+        for (name, text) in [("a.txt", "AB\u{00c9}\n"), ("b.txt", "AB\u{03b1}\n")] {
+            let p = d.join(name);
+            std::fs::write(&p, text).unwrap();
+            docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1);
+        }
+        docs.sort();
+        let mut c = Content::open_shared(d.join("idx"));
+        std::fs::create_dir_all(&c.dir).unwrap();
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        let search = |pat: &str, case: Case| {
+            let mut g = Grep::with_case(pat, GrepMode::Regex, case).unwrap();
+            g.budget = None;
+            c.search(&g, &Query::parse("", "/h").unwrap()).files.len()
+        };
+        let n1 = search(r"ab\u00e9", Case::Smart);
+        let n2 = search(r"ab[\u0391-\u03a9]", Case::Insensitive);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(n1, 1);
+        assert_eq!(n2, 1);
+
+        let non_ascii_tri = TQ::Tri(u32::from_be_bytes([0, b'a', 0xc3, 0xa9]));
+        assert!(matches!(ascii_only(TQ::And(vec![non_ascii_tri.clone()])), TQ::All));
+        assert!(matches!(ascii_only(TQ::Or(vec![TQ::Tri(0x0061_6263), non_ascii_tri])), TQ::All));
+    }
+
+    /// Case-insensitive `GrepMode::Symbol` falls back to trigram planning
+    /// instead of looking up the exact-cased `symbol_key`.
+    #[test]
+    fn case_insensitive_symbol_search_finds_indexed_camel_case() {
+        let d = std::env::temp_dir().join(format!("fsearch-sym-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let mut docs = Docs::default();
+        for (name, text) in [("lib.rs", "pub fn MyFunc() {}\n"), ("other.rs", "pub fn Unrelated() {}\n")] {
+            let p = d.join(name);
+            std::fs::write(&p, text).unwrap();
+            docs.push(p.as_os_str().as_bytes(), text.len() as u64, 1);
+        }
+        docs.sort();
+        let mut c = Content::open_shared(d.join("idx"));
+        std::fs::create_dir_all(&c.dir).unwrap();
+        let id = c.alloc_id();
+        c.push(build_segment(&c.dir, id, &docs, 0..docs.len()).unwrap());
+        let search = |pat: &str, case: Case| {
+            let mut g = Grep::with_case(pat, GrepMode::Symbol, case).unwrap();
+            g.budget = None;
+            c.search(&g, &Query::parse("", "/h").unwrap()).files.len()
+        };
+        let n_ins = search("myfunc", Case::Insensitive);
+        let n_smart = search("myfunc", Case::Smart);
+        let n_sens = search("MyFunc", Case::Sensitive);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(n_ins, 1);
+        assert_eq!(n_smart, 0);
+        assert_eq!(n_sens, 1);
+        assert!(matches!(Grep::with_case("MyFunc", GrepMode::Symbol, Case::Sensitive).unwrap().plan(), TQ::Tri(k) if k == symbol_key(b"MyFunc")));
     }
 }
