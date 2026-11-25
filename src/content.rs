@@ -26,7 +26,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_syntax::hir::{Class, Hir, HirKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -315,9 +315,10 @@ impl Segment {
     fn direct_children(&self, prefix: &[u8]) -> Vec<u32> {
         let bp = self.by_path();
         let mut out = Vec::new();
-        let mut i = bp.partition_point(|&d| self.path(d).as_slice() < prefix);
+        let mut paths = PathCursor::default();
+        let mut i = bp.partition_point(|&d| paths.get(self, d) < prefix);
         while i < bp.len() {
-            let p = self.path(bp[i]);
+            let p = paths.get(self, bp[i]);
             if !p.starts_with(prefix) {
                 break;
             }
@@ -332,7 +333,7 @@ impl Segment {
                     // Jump past "prefix/sub/..." : first path >= "prefix/sub0".
                     let mut hi = p[..prefix.len() + k + 1].to_vec();
                     *hi.last_mut().unwrap() = b'/' + 1;
-                    i += bp[i..].partition_point(|&d| self.path(d) < hi);
+                    i += bp[i..].partition_point(|&d| paths.get(self, d) < hi.as_slice());
                 }
             }
         }
@@ -788,7 +789,7 @@ impl Dedup {
 /// Gids not in use: ascending gaps, then everything from `next`.
 #[derive(Default)]
 struct Gids {
-    gaps: Vec<(u32, u32)>,
+    gaps: VecDeque<(u32, u32)>,
     next: u32,
 }
 
@@ -797,12 +798,12 @@ impl Gids {
     fn take(&mut self, n: usize) -> Vec<u32> {
         let mut out = Vec::with_capacity(n);
         while out.len() < n {
-            match self.gaps.first_mut() {
+            match self.gaps.front_mut() {
                 Some((a, b)) => {
                     out.push(*a);
                     *a += 1;
                     if a == b {
-                        self.gaps.remove(0);
+                        self.gaps.pop_front();
                     }
                 }
                 None => {
@@ -956,9 +957,10 @@ struct SplitContent {
     bloom: std::ops::Range<usize>,
 }
 
-/// Build one segment file from docs (any order). Files that turn out not
-/// to be text are recorded with no content; a file whose bytes are already
-/// indexed (this sync, or before it: see `diff`) just names that content.
+/// Build one segment file from `docs[range]` (in path order for `doc_range`).
+/// Files that turn out not to be text are recorded with no content; a file
+/// whose bytes are already indexed (this sync, or before it: see `diff`)
+/// just names that content.
 pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<usize>) -> Option<Segment> {
     use std::io::Read;
     // Docs in runs of 256, a run on one thread with its next 8 files open
@@ -1264,7 +1266,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
         put_varint(&mut paths, (d.path.len() - shared) as u32);
         paths.extend_from_slice(&d.path[shared..]);
     }
-    // (Docs are files of at most MAX_FILE bytes.)
+    // (Docs are files of at most MAX_REPO_FILE bytes.)
     let size: Vec<u32> = docs.iter().map(|d| d.size as u32).collect();
     let mtime: Vec<u32> = docs.iter().map(|d| d.mtime).collect();
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
@@ -1316,15 +1318,16 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
     let write = || -> std::io::Result<()> {
+        const ZERO: [u8; 64] = [0; 64];
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         f.write_all(&hdr)?;
         let mut at = HDR;
         for (k, sec) in sections.iter().enumerate() {
-            f.write_all(&vec![0u8; off[k] - at])?;
+            f.write_all(&ZERO[..off[k] - at])?;
             f.write_all(sec)?;
             at = off[k] + sec.len();
         }
-        f.write_all(&vec![0u8; ((at + 63) & !63) - at])?;
+        f.write_all(&ZERO[..((at + 63) & !63) - at])?;
         f.flush()
     };
     write().ok()?;
@@ -1344,10 +1347,7 @@ fn name_ok(name: &[u8], size: u64) -> bool {
         return false;
     }
     match name.iter().rposition(|&b| b == b'.').filter(|&p| p > 0) {
-        Some(dot) => {
-            let ext = &name[dot + 1..];
-            TEXT_EXTS.iter().any(|x| x.eq_ignore_ascii_case(ext)) && !name.ends_with(b".min.js") && name != b"package-lock.json"
-        }
+        Some(dot) => TEXT_EXTS.iter().any(|x| x.eq_ignore_ascii_case(&name[dot + 1..])),
         None => size <= 256 << 10,
     }
 }
@@ -2327,10 +2327,10 @@ impl Content {
     /// segments' own contents, by hash, and the gids no segment owns.
     fn dedup(&self) -> Dedup {
         let held = self.segs.iter().filter(|s| s.nown > 0).map(|s| Held { map: s.map.clone(), nown: s.nown, off: s.off }).collect();
-        let (mut gaps, mut next) = (Vec::new(), 0u32);
+        let (mut gaps, mut next) = (VecDeque::new(), 0u32);
         for &(g, n, _, _) in &self.gids {
             if g > next {
-                gaps.push((next, g));
+                gaps.push_back((next, g));
             }
             next = next.max(g + n);
         }
@@ -2347,11 +2347,13 @@ impl Content {
             self.segs
                 .par_iter()
                 .flat_map_iter(|s| (0..s.ndocs as u32).filter(|&d| !s.is_dead(d)).map(move |d| (s, d)))
-                .filter(|&(s, d)| crate::live::lstat(&s.path(d)).is_none_or(|o| o.mtime >= since || o.size != s.size()[d as usize] as u64))
-                .map(|(s, d)| {
-                    let p = s.path(d);
-                    p[..p.iter().rposition(|&b| b == b'/').unwrap_or(0).max(1)].to_vec()
+                .map_init(PathCursor::default, |paths, (s, d)| {
+                    let p = paths.get(s, d);
+                    crate::live::lstat(p)
+                        .is_none_or(|o| o.mtime >= since || o.size != s.size()[d as usize] as u64)
+                        .then(|| p[..p.iter().rposition(|&b| b == b'/').unwrap_or(0).max(1)].to_vec())
                 })
+                .flatten()
                 .collect()
         });
         out.sort();
@@ -2749,14 +2751,14 @@ impl Content {
         let limit = filt.limit;
         // A later page passes over the candidates the pages before read.
         let mut skip = g.skip;
-        let mut from = |n: usize| {
-            let f = skip.min(n);
-            skip -= f;
+        let from = |skip: &mut usize, n: usize| {
+            let f = (*skip).min(n);
+            *skip -= f;
             f
         };
         let (mut r, done) = match fresh.len() {
             0 => (GrepResult { complete: true, ..Default::default() }, 0),
-            n => verify_from(g, from(n), n, limit, Reading::Fresh, t, |i| Some(fresh[i].as_slice().into())),
+            n => verify_from(g, from(&mut skip, n), n, limit, Reading::Fresh, t, |i| Some(fresh[i].as_slice().into())),
         };
         // Then most searches are done within the best few hundred
         // candidates: rank those first, and the rest only if reading gets
@@ -2767,9 +2769,9 @@ impl Content {
             r.complete = more.complete;
             r.next = more.next.map(|x| base + x);
         };
-        if r.files.len() < limit && done == fresh.len() {
+        if r.files.len() < limit && done == fresh.len() && skip < total {
             let best = take_best(&mut per);
-            let (more, done) = verify_from(g, from(best.len()), best.len(), limit - r.files.len(), Reading::Index, t, |i| path(&best[i]));
+            let (more, done) = verify_from(g, from(&mut skip, best.len()), best.len(), limit - r.files.len(), Reading::Index, t, |i| path(&best[i]));
             add(&mut r, more, fresh.len());
             if r.files.len() < limit && done == best.len() && best.len() < total {
                 // Then the next best few thousand, and the others only if
@@ -2788,7 +2790,7 @@ impl Content {
                     if at > 0 {
                         rest[at..].par_sort_unstable();
                     }
-                    let f = at + from(end - at);
+                    let f = at + from(&mut skip, end - at);
                     let (more, done) = verify_from(g, f, end, limit - r.files.len(), Reading::Index, t, |i| path(&rest[i]));
                     add(&mut r, more, fresh.len() + best.len());
                     if r.files.len() >= limit || done < end {
@@ -3710,7 +3712,9 @@ fn verify_from<'a>(
         readers_more()
     } else {
         READERS
-    };
+    }
+    .min(n - from)
+    .max(1);
     without_materializing(|| run_lanes(readers, &work));
     if !scan {
         READING.fetch_sub(1, Relaxed);
@@ -3841,7 +3845,7 @@ fn char_step(b: &[u8]) -> usize {
 /// newline (or in an empty file) there is no line, so no match either.
 fn on_lines<'a>(re: &'a Regex, buf: &'a [u8]) -> impl Iterator<Item = (usize, usize)> + 'a {
     let lines_end = buf.len() + buf.last().is_some_and(|&b| b != b'\n') as usize;
-    let (mut at, mut last, mut queue) = (0, None, std::collections::VecDeque::new());
+    let (mut at, mut last, mut queue) = (0, None, VecDeque::new());
     std::iter::from_fn(move || {
         loop {
             if let Some(m) = queue.pop_front() {
@@ -4809,7 +4813,10 @@ fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
 fn open_ahead_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
     use std::os::unix::io::AsRawFd;
     let (f, len) = open_sized(path)?;
-    let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_REPO_FILE + 1) as libc::c_int };
+    if len == 0 || len > MAX_REPO_FILE {
+        return None;
+    }
+    let ra = libc::radvisory { ra_offset: 0, ra_count: len as libc::c_int };
     unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
     Some((f, len))
 }
