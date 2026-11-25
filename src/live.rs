@@ -8,7 +8,7 @@
 
 use crate::index::{Index, enc_size};
 use crate::walk::{self, FLAG_MOUNT, KIND_DIR, Listing, NONE, RawEnt};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy)]
 pub struct OEnt {
@@ -282,6 +282,29 @@ impl Live {
         cur
     }
 
+    /// Child names under `p` that have descendant overlay entries even though
+    /// `p/<name>` itself is absent from both `base` and `over` (e.g. a child
+    /// directory flushed before its parent).
+    fn orphan_children(&self, p: &[u8], cur: &HashMap<Vec<u8>, Option<u32>>) -> HashSet<Vec<u8>> {
+        let mut orphans = HashSet::new();
+        let (lo, hi) = subtree_bounds(p);
+        let plen = lo.len();
+        let mut last: Option<&[u8]> = None;
+        for k in self.over.range(lo..hi).map(|(k, _)| k) {
+            let rest = &k[plen..];
+            if let Some(slash) = rest.iter().position(|&b| b == b'/') {
+                let comp = &rest[..slash];
+                if last != Some(comp) {
+                    last = Some(comp);
+                    if !cur.contains_key(comp) {
+                        orphans.insert(comp.to_vec());
+                    }
+                }
+            }
+        }
+        orphans
+    }
+
     /// The memory half of `apply_dir`: diff what `fetch` read into the index.
     pub fn apply(&mut self, mut f: Fetched) -> Applied {
         if f.blocked {
@@ -295,23 +318,49 @@ impl Live {
             self.remove_path(&p);
             if let Some(attrs) = f.attrs {
                 let scan = f.scans.remove(&p);
+                let is_dir = attrs.kind & 3 == KIND_DIR && attrs.kind & FLAG_MOUNT == 0;
                 self.add_new(p, attrs, scan);
+                // `remove_path` already pushed `p` to `self.trees`.
+                if is_dir {
+                    self.trees.pop();
+                }
             }
             return Applied::Done;
         }
         let Some(listing) = f.listing else {
-            if f.attrs.is_none() {
-                self.remove_path(&p);
+            match f.attrs {
+                None => self.remove_path(&p),
+                Some(attrs) if attrs.kind & 3 != KIND_DIR => {
+                    // Replaced by a non-dir without a parent event: drop the
+                    // stale dir subtree and record the new entry (never wipe on
+                    // KIND_DIR, where list_one can fail on EACCES/EMFILE).
+                    let was_dir = self.base_alive(&p).is_some_and(|e| self.base.kind(e as usize) & 3 == KIND_DIR)
+                        || self.over.get(&p).is_some_and(|o| o.kind & 3 == KIND_DIR)
+                        || {
+                            let (lo, hi) = subtree_bounds(&p);
+                            self.over.range(lo..hi).next().is_some()
+                        };
+                    if was_dir {
+                        self.remove_path(&p);
+                        self.add_new(p, attrs, None);
+                    }
+                }
+                Some(_) => {}
             }
             return Applied::Done;
         };
         let mut cur = self.current_children(&p);
+        let mut orphans = self.orphan_children(&p, &cur);
         for r in &listing.ents {
             let name = &listing.names[r.name_off as usize..][..r.name_len as usize];
             let child = join(&p, name);
             let now = OEnt::new(name, r.kind, r.size, r.mtime);
             match cur.remove(name) {
                 None => {
+                    if orphans.remove(name) {
+                        self.trees.push(child.clone());
+                        self.drop_over_subtree(&child);
+                    }
                     let scan = f.scans.remove(&child);
                     self.add_new(child, now, scan)
                 }
@@ -364,6 +413,11 @@ impl Live {
                     self.drop_over_subtree(&child)
                 }
             }
+        }
+        for name in orphans {
+            let child = join(&p, &name);
+            self.trees.push(child.clone());
+            self.drop_over_subtree(&child);
         }
         Applied::Done
     }
@@ -593,5 +647,179 @@ mod tests {
         let f = live.fetch(b"/dev", true);
         assert!(f.scans.is_empty() && f.attrs.is_some_and(|a| a.kind & FLAG_MOUNT != 0));
         assert!(!walk::is_mount(b"/usr/bin") && !walk::is_mount(b"/Users") && walk::is_mount(b"/System/Volumes/Data"));
+    }
+
+    /// Orphaned overlay descendants whose parent dir is in neither `base` nor
+    /// `over` (child flushed before parent) are dropped when the parent
+    /// flushes and the dir has been deleted.
+    #[test]
+    fn orphan_dir_deleted_before_parent_flush() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-orphan-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let mut live = Live::new(base_for(&root));
+
+        std::fs::create_dir_all(d.join("app/sub")).unwrap();
+        std::fs::write(d.join("app/sub/ghost.txt"), "x").unwrap();
+        live.apply_dir(&join(&root, b"app"), false);
+
+        std::fs::remove_dir_all(d.join("app")).unwrap();
+        live.trees.clear();
+        live.apply_dir(&root, false);
+        let _ = std::fs::remove_dir_all(&d);
+
+        let rel = |k: &Vec<u8>| String::from_utf8_lossy(&k[root.len()..]).into_owned();
+        assert_eq!(live.over.keys().filter(|k| k.starts_with(&root)).map(rel).collect::<Vec<_>>(), Vec::<String>::new());
+        assert_eq!(live.trees.iter().map(rel).collect::<Vec<_>>(), ["/app"]);
+    }
+
+    /// Orphaned overlay descendants under an unrecorded dir are dropped and
+    /// `trees` is notified when that dir is replaced by a regular file before
+    /// the parent flushes.
+    #[test]
+    fn orphan_dir_replaced_by_file_before_parent_flush() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-orphan-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let mut live = Live::new(base_for(&root));
+
+        std::fs::create_dir_all(d.join("app/sub")).unwrap();
+        std::fs::write(d.join("app/sub/ghost.txt"), "x").unwrap();
+        live.apply_dir(&join(&root, b"app"), false);
+
+        std::fs::remove_dir_all(d.join("app")).unwrap();
+        std::fs::write(d.join("app"), "x").unwrap();
+        live.trees.clear();
+        live.apply_dir(&root, false);
+        let _ = std::fs::remove_dir_all(&d);
+
+        let rel = |k: &Vec<u8>| String::from_utf8_lossy(&k[root.len()..]).into_owned();
+        assert_eq!(live.over.keys().filter(|k| k.starts_with(&root)).map(rel).collect::<Vec<_>>(), ["/app"]);
+        assert_eq!(live.over[&join(&root, b"app")].kind & 3, walk::KIND_FILE);
+        assert_eq!(live.trees.iter().map(rel).collect::<Vec<_>>(), ["/app"]);
+    }
+
+    /// Orphaned overlay descendants under an unrecorded dir that still exists
+    /// are dropped before the new scan is inserted when the parent flushes.
+    #[test]
+    fn orphan_dir_with_stale_child_before_parent_flush() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-orphan-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let mut live = Live::new(base_for(&root));
+
+        std::fs::create_dir_all(d.join("app/sub")).unwrap();
+        std::fs::write(d.join("app/sub/ghost.txt"), "x").unwrap();
+        live.apply_dir(&join(&root, b"app"), false);
+
+        std::fs::remove_file(d.join("app/sub/ghost.txt")).unwrap();
+        std::fs::write(d.join("app/new.txt"), "x").unwrap();
+        live.trees.clear();
+        live.apply_dir(&root, false);
+        let _ = std::fs::remove_dir_all(&d);
+
+        let rel = |k: &Vec<u8>| String::from_utf8_lossy(&k[root.len()..]).into_owned();
+        assert_eq!(
+            live.over.keys().filter(|k| k.starts_with(&root)).map(rel).collect::<Vec<_>>(),
+            ["/app", "/app/new.txt", "/app/sub"]
+        );
+        live.trees.sort();
+        live.trees.dedup();
+        assert_eq!(live.trees.iter().map(rel).collect::<Vec<_>>(), ["/app"]);
+    }
+
+    /// Replacing a directory (base or overlay) with a regular file without a
+    /// parent event must drop the stale directory and its descendants when
+    /// `apply_dir(p, false)` runs on `p` itself.
+    #[test]
+    fn dir_replaced_by_file_via_apply_dir_on_base_and_overlay() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-dir2file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("base_dir")).unwrap();
+        std::fs::write(d.join("base_dir/old.txt"), "x").unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let base_dir = join(&root, b"base_dir");
+        let over_dir = join(&root, b"over_dir");
+        let orphan_dir = join(&root, b"orphan_dir");
+
+        let mut live = Live::new(base_for(&root));
+        // Add an overlay child under the base dir, a new overlay dir with a
+        // child, and an orphan descendant whose parent dir was never inserted.
+        std::fs::write(d.join("base_dir/added.txt"), "x").unwrap();
+        live.apply_dir(&base_dir, false);
+        std::fs::create_dir_all(d.join("over_dir")).unwrap();
+        std::fs::write(d.join("over_dir/child.txt"), "x").unwrap();
+        live.apply_dir(&root, false);
+        std::fs::create_dir_all(d.join("orphan_dir/sub")).unwrap();
+        std::fs::write(d.join("orphan_dir/sub/leaf.txt"), "x").unwrap();
+        live.apply_dir(&join(&orphan_dir, b"sub"), false);
+        assert!(live.over.contains_key(&join(&base_dir, b"added.txt")));
+        assert!(live.over.get(&over_dir).is_some_and(|o| o.kind & 3 == KIND_DIR));
+        assert!(live.over.contains_key(&join(&over_dir, b"child.txt")));
+        assert!(!live.over.contains_key(&orphan_dir));
+        assert!(live.over.contains_key(&join(&orphan_dir, b"sub/leaf.txt")));
+
+        // Replace all three dirs with regular files on disk, and apply directly on each path.
+        std::fs::remove_dir_all(d.join("base_dir")).unwrap();
+        std::fs::write(d.join("base_dir"), "file").unwrap();
+        std::fs::remove_dir_all(d.join("over_dir")).unwrap();
+        std::fs::write(d.join("over_dir"), "file").unwrap();
+        std::fs::remove_dir_all(d.join("orphan_dir")).unwrap();
+        std::fs::write(d.join("orphan_dir"), "file").unwrap();
+        live.trees.clear();
+        live.apply_dir(&base_dir, false);
+        live.apply_dir(&over_dir, false);
+        live.apply_dir(&orphan_dir, false);
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(live.base_alive(&base_dir).is_none(), "base_dir should be killed");
+        assert!(live.base_alive(&join(&base_dir, b"old.txt")).is_none(), "base_dir/old.txt should be killed");
+        assert!(!live.over.contains_key(&join(&base_dir, b"added.txt")), "stale overlay child under base_dir remained");
+        assert!(!live.over.contains_key(&join(&over_dir, b"child.txt")), "stale overlay child under over_dir remained");
+        assert!(!live.over.contains_key(&join(&orphan_dir, b"sub/leaf.txt")), "stale orphan child remained");
+        assert_eq!(live.over.get(&base_dir).map(|o| o.kind & 3), Some(walk::KIND_FILE));
+        assert_eq!(live.over.get(&over_dir).map(|o| o.kind & 3), Some(walk::KIND_FILE));
+        assert_eq!(live.over.get(&orphan_dir).map(|o| o.kind & 3), Some(walk::KIND_FILE));
+        live.trees.sort();
+        let rel = |k: &Vec<u8>| String::from_utf8_lossy(&k[root.len()..]).into_owned();
+        assert_eq!(live.trees.iter().map(rel).collect::<Vec<_>>(), ["/base_dir", "/orphan_dir", "/over_dir"]);
+    }
+
+    /// An unreadable directory (`list_one` fails with EACCES while `lstat`
+    /// still reports `KIND_DIR`) must never be wiped by `apply_dir(p, false)`.
+    #[test]
+    fn unreadable_dir_not_wiped_by_apply_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("fsearch-live-eacces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let locked = d.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("keep.txt"), "x").unwrap();
+        let d = d.canonicalize().unwrap();
+        let locked = d.join("locked");
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let locked_bytes = locked.as_os_str().as_encoded_bytes().to_vec();
+
+        let mut live = Live::new(base_for(&root));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(walk::list_one(&locked_bytes).is_none());
+        live.trees.clear();
+        live.apply_dir(&locked_bytes, false);
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(live.base_alive(&locked_bytes).is_some(), "unreadable dir was wiped");
+        assert!(live.base_alive(&join(&locked_bytes, b"keep.txt")).is_some(), "child of unreadable dir was wiped");
+        assert!(live.trees.is_empty(), "unreadable dir emitted tree resync");
     }
 }
