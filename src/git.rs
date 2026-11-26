@@ -285,6 +285,10 @@ impl Git {
     pub fn status(&self, path: &[u8]) -> Option<u8> {
         let r = self.repo(path)?;
         let s = r.snap(Duration::ZERO)?;
+        // An unread repo is not a clean tree.
+        if s.untrusted {
+            return None;
+        }
         Some(s.status(r.rel(path)?))
     }
 
@@ -522,19 +526,19 @@ impl Git {
         if specs.is_empty() {
             return Some(s);
         }
-        let found = parse(&self.run(&r.root, &status_args(), &specs)?);
-        // Out with what the pathspecs covered, in with what git says now.
-        let covered = |p: &[u8]| {
-            let parent = &p[..p.iter().rposition(|&b| b == b'/').unwrap_or(0)];
-            dirs.iter().any(|(d, rec)| if *rec { d.is_empty() || p == &d[..] || p.starts_with(&[&d[..], b"/"].concat()) } else { parent == &d[..] })
-        };
         let restaged: HashSet<Vec<u8>> = specs.iter().filter_map(|s| s.strip_prefix(b":(literal)")).map(<[u8]>::to_vec).collect();
-        s.files.retain(|p, _| !covered(p) && !restaged.contains(&p[..]));
-        s.dirs.retain(|p, _| !covered(p));
-        for (path, bits) in found {
-            insert(&mut s, path, bits);
+        // A directory mark this read will drop has to be asked about, or an untracked
+        // folder under it (which `:(glob)dir/*` does not re-report) disappears with the mark.
+        for d in s.dirs.keys() {
+            if !d.is_empty() && dir_mark_drops(d, &dirs, &restaged) {
+                let spec = [b":(literal)", &d[..]].concat();
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
+            }
         }
-        Some(s)
+        let found = parse(&self.run(&r.root, &status_args(), &specs)?);
+        Some(apply_status(&s, &dirs, &restaged, found))
     }
 
     /// See `Snap::history`. By author time (a rebase isn't new work), as
@@ -601,6 +605,33 @@ impl Git {
         let ok = child.wait().is_ok_and(|s| s.success());
         out.filter(|_| ok)
     }
+}
+
+/// A pathspec covers `p` (a file, or a directory mark without its slash).
+/// A non-recursive spec covers the directory itself, not only its children.
+fn covers(p: &[u8], dirs: &HashMap<Vec<u8>, bool>) -> bool {
+    let parent = &p[..p.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+    dirs.iter().any(
+        |(d, rec)| {
+            if *rec { d.is_empty() || p == &d[..] || p.starts_with(&[&d[..], b"/"].concat()) } else { parent == &d[..] || p == &d[..] }
+        },
+    )
+}
+
+/// A directory mark this update will drop, so status must be asked about it again.
+fn dir_mark_drops(p: &[u8], dirs: &HashMap<Vec<u8>, bool>, restaged: &HashSet<Vec<u8>>) -> bool {
+    covers(p, dirs) || (!p.is_empty() && restaged.iter().any(|r| r.starts_with(&[&p[..], b"/"].concat())))
+}
+
+/// Merge one status read into `old`: drop what the pathspecs covered, keep the rest, insert `found`.
+fn apply_status(old: &Snap, dirs: &HashMap<Vec<u8>, bool>, restaged: &HashSet<Vec<u8>>, found: Vec<(Vec<u8>, u8)>) -> Snap {
+    let mut s = old.clone();
+    s.files.retain(|p, _| !covers(p, dirs) && !restaged.contains(&p[..]));
+    s.dirs.retain(|p, _| !dir_mark_drops(p, dirs, restaged));
+    for (path, bits) in found {
+        insert(&mut s, path, bits);
+    }
+    s
 }
 
 fn status_args() -> [&'static str; 6] {
@@ -725,5 +756,54 @@ mod tests {
         assert_eq!(pending(), (vec![(Vec::new(), true)], false), "FSEvents lost track of /");
         g.changed(&[(&b"/p/repo/.git"[..], false)]);
         assert_eq!(pending(), (Vec::new(), true));
+    }
+
+    /// A repo whose status was deliberately not read is unknown, not clean.
+    #[test]
+    fn untrusted_snapshot_is_unknown() {
+        if git_bin().is_none() {
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("fsearch-untrusted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        let d = d.canonicalize().unwrap();
+        let g = Git::new("/nonexistent-fsearch-home");
+        let r = g.add(d.as_os_str().as_bytes());
+        let mut snap = Snap::default();
+        snap.untrusted = true;
+        *r.snap.write().unwrap() = Some(Arc::new(snap));
+        let file = [d.as_os_str().as_bytes(), b"/a.rs"].concat();
+        assert_eq!(g.status(&file), None);
+        *r.snap.write().unwrap() = Some(Arc::new(Snap::default()));
+        assert_eq!(g.status(&file), Some(0));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directory git no longer reports is not left marked, including the
+    /// folder a non-recursive event named and a folder above a restaged file.
+    #[test]
+    fn stale_directory_marks_drop() {
+        let mut old = Snap::default();
+        insert(&mut old, b"newlib/".to_vec(), UNTRACKED);
+        insert(&mut old, b"newlib/a".to_vec(), UNTRACKED);
+        insert(&mut old, b"src/x.rs".to_vec(), MODIFIED);
+        let mut dirs = HashMap::new();
+        dirs.insert(b"newlib".to_vec(), false);
+        let s = apply_status(&old, &dirs, &HashSet::new(), vec![(b"newlib/b".to_vec(), UNTRACKED)]);
+        assert!(s.dirs.get(&b"newlib"[..]).is_none(), "non-recursive update kept the directory mark");
+        assert_eq!(s.files.get(&b"newlib/a"[..]), None);
+        assert_eq!(s.files.get(&b"newlib/b"[..]), Some(&UNTRACKED));
+        assert_eq!(s.files.get(&b"src/x.rs"[..]), Some(&MODIFIED));
+
+        let mut old = Snap::default();
+        insert(&mut old, b"newlib/".to_vec(), UNTRACKED);
+        insert(&mut old, b"other/".to_vec(), UNTRACKED);
+        let restaged = HashSet::from([b"newlib/a".to_vec()]);
+        assert!(dir_mark_drops(b"newlib", &HashMap::new(), &restaged));
+        let s = apply_status(&old, &HashMap::new(), &restaged, vec![(b"newlib/b".to_vec(), UNTRACKED)]);
+        assert!(s.dirs.get(&b"newlib"[..]).is_none(), "ancestor of a restaged path");
+        assert_eq!(s.dirs.get(&b"other"[..]), Some(&UNTRACKED));
+        assert_eq!(s.files.get(&b"newlib/b"[..]), Some(&UNTRACKED));
     }
 }

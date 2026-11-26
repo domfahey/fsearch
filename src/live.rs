@@ -292,10 +292,21 @@ impl Live {
             if p == b"/" {
                 return Applied::Rebuild;
             }
-            self.remove_path(&p);
-            if let Some(attrs) = f.attrs {
-                let scan = f.scans.remove(&p);
-                self.add_new(p, attrs, scan);
+            // Gone. A directory that is still there but could not be listed keeps its children.
+            let Some(attrs) = f.attrs else {
+                self.remove_path(&p);
+                return Applied::Done;
+            };
+            if let Some(mut scan) = f.scans.remove(&p) {
+                if scan.first().is_some_and(|l| l.failed) {
+                    return Applied::Done;
+                }
+                scan = self.graft_failed(scan, &p);
+                self.remove_path(&p);
+                self.add_new(p, attrs, Some(scan));
+            } else {
+                self.remove_path(&p);
+                self.add_new(p, attrs, None);
             }
             return Applied::Done;
         }
@@ -368,6 +379,79 @@ impl Live {
         Applied::Done
     }
 
+    /// Replace listings that failed with the children the index already has,
+    /// so the rebuild that follows a recursive update puts those children back.
+    fn graft_failed(&self, scan: Vec<Listing>, root: &[u8]) -> Vec<Listing> {
+        if !scan.iter().any(|l| l.failed) {
+            return scan;
+        }
+        let mut by_id: HashMap<u32, &Listing> = HashMap::with_capacity(scan.len());
+        for l in &scan {
+            by_id.insert(l.id, l);
+        }
+        let mut path_of: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut stack = vec![(0u32, root.to_vec())];
+        while let Some((id, path)) = stack.pop() {
+            path_of.insert(id, path.clone());
+            let Some(l) = by_id.get(&id) else { continue };
+            for r in &l.ents {
+                if r.child != NONE {
+                    let name = &l.names[r.name_off as usize..][..r.name_len as usize];
+                    stack.push((r.child, join(&path, name)));
+                }
+            }
+        }
+        let failed: Vec<u32> = scan.iter().filter(|l| l.failed).map(|l| l.id).collect();
+        let mut next = scan.iter().map(|l| l.id).max().unwrap_or(0).saturating_add(1);
+        let mut replace: HashMap<u32, Listing> = HashMap::new();
+        let mut extra = Vec::new();
+        for id in failed {
+            let Some(path) = path_of.get(&id) else { continue };
+            let mut built = self.listings_from_index(path, id, &mut next);
+            if let Some(i) = built.iter().position(|l| l.id == id) {
+                replace.insert(id, built.swap_remove(i));
+            }
+            extra.extend(built);
+        }
+        let mut out: Vec<Listing> = scan.into_iter().map(|l| replace.remove(&l.id).unwrap_or(l)).collect();
+        out.extend(extra);
+        out
+    }
+
+    /// Listings of what the index holds under `path`, with `path`'s own listing at `id`.
+    fn listings_from_index(&self, path: &[u8], id: u32, next: &mut u32) -> Vec<Listing> {
+        let mut l = Listing { id, ..Listing::default() };
+        let mut more = Vec::new();
+        for (name, ent) in self.current_children(path) {
+            if name.len() > u16::MAX as usize {
+                continue;
+            }
+            let (kind, size, mtime, descend) = match ent {
+                Some(c) => {
+                    let k = self.base.kind(c as usize);
+                    (k, self.base.size_of(c as usize), self.base.mtime(c as usize), k & 3 == KIND_DIR && k & FLAG_MOUNT == 0)
+                }
+                None => {
+                    let o = &self.over[&join(path, &name)];
+                    (o.kind, o.size, o.mtime, o.kind & 3 == KIND_DIR && o.kind & FLAG_MOUNT == 0)
+                }
+            };
+            let child = if descend {
+                let c = *next;
+                *next += 1;
+                more.extend(self.listings_from_index(&join(path, &name), c, next));
+                c
+            } else {
+                NONE
+            };
+            l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child });
+            l.names.extend_from_slice(&name);
+        }
+        let mut out = vec![l];
+        out.extend(more);
+        out
+    }
+
     /// Add an entry and, if it is a directory, its subtree (`scan`, read
     /// ahead by `fetch`; scanned here if missing).
     fn add_new(&mut self, path: Vec<u8>, e: OEnt, scan: Option<Vec<Listing>>) {
@@ -428,7 +512,7 @@ impl Live {
         let mut stack: Vec<(Option<u32>, Vec<u8>, u32)> = vec![(Some(0), b"/".to_vec(), 0)];
         let mut next = 1u32;
         while let Some((bd, path, id)) = stack.pop() {
-            let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+            let mut l = Listing { id, ..Listing::default() };
             let mut push = |l: &mut Listing, name: &[u8], kind: u8, size: u64, mtime: u32, child_path: Option<Vec<u8>>, bdir: Option<u32>| {
                 let child = match child_path {
                     Some(cp) => {
@@ -534,6 +618,7 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// An index of `root` with real paths: the folders above it as one-entry
     /// listings, then a scan of it.
@@ -542,7 +627,7 @@ mod tests {
         let k = comps.len() as u32;
         let above = |(i, c): (usize, &&[u8])| {
             let e = RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child: i as u32 + 1 };
-            Listing { id: i as u32, names: c.to_vec(), ents: vec![e] }
+            Listing { id: i as u32, names: c.to_vec(), ents: vec![e], failed: false }
         };
         let mut ls: Vec<Listing> = comps.iter().enumerate().map(above).collect();
         for mut l in walk::scan(root, 2) {
@@ -593,5 +678,62 @@ mod tests {
         let f = live.fetch(b"/dev", true);
         assert!(f.scans.is_empty() && f.attrs.is_some_and(|a| a.kind & FLAG_MOUNT != 0));
         assert!(!walk::is_mount(b"/usr/bin") && !walk::is_mount(b"/Users") && walk::is_mount(b"/System/Volumes/Data"));
+    }
+
+    /// A directory that cannot be listed still has its indexed children.
+    /// A directory that can be listed and is empty does not.
+    #[test]
+    fn unreadable_directory_keeps_its_children() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("file"), "x").unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let sub_path = join(&root, b"sub");
+        let file = join(&sub_path, b"file");
+        let mut live = Live::new(base_for(&root));
+        let alive = |live: &Live, p: &[u8]| live.base.lookup(p).is_some_and(|e| !live.is_dead(e)) || live.over.contains_key(p);
+        assert!(alive(&live, &file));
+        let mut perms = std::fs::metadata(&d.join("sub")).unwrap().permissions();
+        perms.set_mode(0);
+        std::fs::set_permissions(d.join("sub"), perms.clone()).unwrap();
+        live.apply_dir(&sub_path, true);
+        perms.set_mode(0o755);
+        std::fs::set_permissions(d.join("sub"), perms).unwrap();
+        assert!(alive(&live, &file), "open failure dropped indexed children");
+        std::fs::remove_file(d.join("sub").join("file")).unwrap();
+        live.apply_dir(&sub_path, true);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!alive(&live, &file), "a listed empty directory keeps deleted children");
+    }
+
+    /// A recursive update of the parent, whose child directory cannot be listed,
+    /// keeps that child's indexed files. Listing the parent afterwards drops a file that is gone.
+    #[test]
+    fn unreadable_nested_directory_keeps_its_children() {
+        let d = std::env::temp_dir().join(format!("fsearch-live-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("file"), "x").unwrap();
+        let d = d.canonicalize().unwrap();
+        let root = d.as_os_str().as_encoded_bytes().to_vec();
+        let file = join(&join(&root, b"sub"), b"file");
+        let mut live = Live::new(base_for(&root));
+        let alive = |live: &Live, p: &[u8]| live.base.lookup(p).is_some_and(|e| !live.is_dead(e)) || live.over.contains_key(p);
+        assert!(alive(&live, &file));
+        let mut perms = std::fs::metadata(d.join("sub")).unwrap().permissions();
+        perms.set_mode(0);
+        std::fs::set_permissions(d.join("sub"), perms.clone()).unwrap();
+        live.apply_dir(&root, true);
+        perms.set_mode(0o755);
+        std::fs::set_permissions(d.join("sub"), perms).unwrap();
+        assert!(alive(&live, &file), "a nested open failure dropped indexed children");
+        std::fs::remove_file(d.join("sub").join("file")).unwrap();
+        live.apply_dir(&root, true);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!alive(&live, &file), "a listed directory keeps a deleted child");
     }
 }

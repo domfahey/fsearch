@@ -1241,6 +1241,19 @@ pub fn dec_size(v: u32) -> u64 {
     if v & (1 << 31) == 0 { v as u64 } else { ((v & !(1 << 31)) as u64) << 21 }
 }
 
+/// The stored size meets inclusive `[lo, hi]`. Below 2 GiB it is exact.
+/// Above, it is the start of a 2 MiB bucket, and the true size is anywhere in that bucket.
+pub fn bucket_holds(raw: u32, lo: u64, hi: u64) -> bool {
+    let dec = dec_size(raw);
+    if raw & (1 << 31) == 0 { dec >= lo && dec <= hi } else { dec <= hi && dec.saturating_add(1 << 21) > lo }
+}
+
+/// The stored size can be at least `lo` (a zone whose largest bucket is entirely below `lo` cannot).
+pub fn bucket_reaches(raw: u32, lo: u64) -> bool {
+    let dec = dec_size(raw);
+    if raw & (1 << 31) == 0 { dec >= lo } else { dec.saturating_add(1 << 21) > lo }
+}
+
 /// FxHash: interning 7.5M names wants a hasher cheaper than SipHash.
 #[derive(Clone, Copy, Default)]
 pub struct Fx;
@@ -1398,7 +1411,12 @@ mod tests {
     #[test]
     fn deep_path() {
         let ent = |kind, child| RawEnt { name_off: 0, name_len: 1, kind, size: 0, mtime: 0, child };
-        let ls = (0..=300).map(|i| Listing { id: i, names: b"d".to_vec(), ents: vec![if i < 300 { ent(KIND_DIR, i + 1) } else { ent(0, NONE) }] });
+        let ls = (0..=300).map(|i| Listing {
+            id: i,
+            names: b"d".to_vec(),
+            ents: vec![if i < 300 { ent(KIND_DIR, i + 1) } else { ent(0, NONE) }],
+            failed: false,
+        });
         let idx = Index::build(ls.collect(), 0, 0, b"/h");
         let mut p = Vec::new();
         idx.path(idx.n - 1, &mut p);

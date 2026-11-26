@@ -49,7 +49,7 @@ fn scan_home(home: &[u8]) -> Vec<Listing> {
     }
     for (i, c) in comps.iter().enumerate() {
         let ent = RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child: i as u32 + 1 };
-        ls.push(Listing { id: i as u32, names: c.to_vec(), ents: vec![ent] });
+        ls.push(Listing { id: i as u32, names: c.to_vec(), ents: vec![ent], failed: false });
     }
     ls
 }

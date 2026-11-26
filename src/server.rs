@@ -197,9 +197,7 @@ struct Hit<'a> {
 fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
     let engine = &cx.engine;
     let op = v.get("op").and_then(Value::as_str).unwrap_or("search");
-    let is_grep = op == "grep"
-        || (op == "search"
-            && v.get("q").and_then(Value::as_str).is_some_and(|q| ["grep:", "regex:", "sym:", "content:", "symbol:"].iter().any(|k| q.contains(k))));
+    let is_grep = is_content_query(op, v);
     match op {
         "ping" => Ok(Reply::Value(json!({"ok": true}))),
         "save" => {
@@ -215,7 +213,9 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
                 _ => return Err("open needs a path (or paths)".into()),
             };
             let now = fsearch::query::now_secs();
-            let scores: Vec<f32> = paths.iter().map(|p| cx.frecency.open(&real(p), now)).collect();
+            let home = engine.home();
+            let cwd = v.get("cwd").and_then(Value::as_str).map(|c| resolve(c, home, None));
+            let scores: Vec<f32> = paths.iter().map(|p| cx.frecency.open(&resolve(p, home, cwd.as_deref()), now)).collect();
             Ok(Reply::Value(json!({"ok": true, "scores": scores})))
         }
         "recent" => {
@@ -230,7 +230,9 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
             // The repo holding a folder, its status read in the background
             // (`fsearch mcp` asks at start, so the first search has it).
             let p = v.get("path").and_then(Value::as_str).ok_or("git needs a path")?;
-            let r = cx.git.load(&[&real(p)[..], b"/."].concat());
+            let home = engine.home();
+            let cwd = v.get("cwd").and_then(Value::as_str).map(|c| resolve(c, home, None));
+            let r = cx.git.load(&[&resolve(p, home, cwd.as_deref())[..], b"/."].concat());
             let snap = r.as_ref().and_then(|r| r.snap(Duration::ZERO));
             Ok(Reply::Value(json!({
                 "ok": true,
@@ -250,7 +252,7 @@ fn run(v: &Value, cx: &Ctx) -> Result<Reply, String> {
         }
         "search" | "glob" => {
             let (mut q, sels) = parse_request(v, engine.home())?;
-            let x = Extras::parse(v, &mut q, sels, op == "glob", false)?;
+            let x = Extras::parse(v, &mut q, sels, op == "glob", false, engine.home())?;
             let t = Instant::now();
             if x.plain() {
                 let found = engine.search(&q)?;
@@ -327,8 +329,9 @@ const MAX_REPOS: usize = 16;
 const MAX_DIRS: usize = 64;
 
 impl Extras {
-    fn parse(v: &Value, q: &mut Query, sels: Vec<(git::Sel, bool)>, glob_op: bool, grep: bool) -> Result<Extras, String> {
-        let cwd = v.get("cwd").and_then(Value::as_str).map(real);
+    fn parse(v: &Value, q: &mut Query, sels: Vec<(git::Sel, bool)>, glob_op: bool, grep: bool, home: &str) -> Result<Extras, String> {
+        let cwd = v.get("cwd").and_then(Value::as_str).map(|c| resolve(c, home, None));
+        let near = v.get("near").and_then(Value::as_str).map(|p| resolve(p, home, cwd.as_deref()));
         // `cursor` too, except in a grep: there it is where the content
         // index's ranking resumes (see `grep`), not a count of files shown.
         let at = v.get("offset").or(v.get("cursor").filter(|_| !grep));
@@ -341,7 +344,7 @@ impl Extras {
             sels,
             cwd,
             boost: v.get("boost") == Some(&Value::Bool(true)),
-            near: v.get("near").and_then(Value::as_str).map(real),
+            near,
         };
         if let Some(o) = at {
             // Past what a page can be fetched from, every page is empty.
@@ -456,9 +459,9 @@ fn from_git(cx: &Ctx, q: &Query, x: &Extras, want: usize) -> Vec<Found> {
     let (mut out, mut dirs) = (Vec::new(), Vec::new());
     for r in repos_at(cx, x.base(q)) {
         let Some(snap) = r.snap(deadline.saturating_duration_since(Instant::now())) else { continue };
-        for (rel, _) in snap.files.iter().chain(&snap.dirs).filter(|(_, b)| pass(**b)) {
+        for (rel, bits) in snap.files.iter().chain(&snap.dirs).filter(|(_, b)| pass(**b)) {
             let path = [&r.root[..], b"/", rel].concat();
-            if let Some(f) = found(q, &path) {
+            if let Some(f) = found_git(q, &path, *bits) {
                 out.push(f);
             }
             if snap.dirs.contains_key(rel) {
@@ -535,13 +538,61 @@ fn git_root(dir: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// A path as the index has it: `~` expanded, symlinks resolved.
-fn real(p: &str) -> Vec<u8> {
-    let p = match p.strip_prefix('~') {
-        Some(rest) => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
-        None => p.to_string(),
+/// Where the next page starts. An empty page does not repeat the cursor.
+fn page_next(explicit: Option<usize>, early: bool, offset: usize, shown: usize) -> Option<usize> {
+    explicit.or(early.then_some(offset + shown)).filter(|&n| shown > 0 && n > offset)
+}
+
+/// `op: grep`, a content field, or a content token. A `path:` value that
+/// merely contains one of those words is still a name search.
+fn is_content_query(op: &str, v: &Value) -> bool {
+    if op == "grep" {
+        return true;
+    }
+    if op != "search" {
+        return false;
+    }
+    let field = |k: &str| v.get(k).and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+    if ["grep", "regex", "content", "symbol", "sym"].iter().any(|k| field(k)) {
+        return true;
+    }
+    let q = v.get("q").and_then(Value::as_str).unwrap_or("");
+    q.split_whitespace().any(|tok| {
+        let t = tok.strip_prefix('!').unwrap_or(tok);
+        ["grep:", "regex:", "sym:", "content:", "symbol:"].iter().any(|k| t.starts_with(k))
+    })
+}
+
+/// `~` and `~/` expand to `home`. A relative path joins `cwd` when the request has one, else `home`.
+fn resolve(p: &str, home: &str, cwd: Option<&[u8]>) -> Vec<u8> {
+    let expanded = fsearch::query::expand_home(p, home);
+    let full = if expanded.starts_with('/') {
+        expanded
+    } else {
+        let base = match cwd {
+            Some(c) if !c.is_empty() => String::from_utf8_lossy(c).into_owned(),
+            _ => {
+                let h = home.trim_end_matches('/');
+                if h.is_empty() { "/".to_string() } else { h.to_string() }
+            }
+        };
+        let base = base.trim_end_matches('/');
+        if base.is_empty() || base == "/" { format!("/{expanded}") } else { format!("{base}/{expanded}") }
     };
-    std::fs::canonicalize(&p).map_or_else(|_| p.into_bytes(), |c| c.as_os_str().as_bytes().to_vec())
+    std::fs::canonicalize(&full).map_or_else(|_| full.into_bytes(), |c| c.as_os_str().as_bytes().to_vec())
+}
+
+/// A path as a hit of a git listing. A deletion has no inode and is still a file hit.
+/// Any other missing path is not.
+fn found_git(q: &Query, path: &[u8], bits: u8) -> Option<Found> {
+    if let Some(f) = found(q, path) {
+        return Some(f);
+    }
+    if bits & git::DELETED == 0 {
+        return None;
+    }
+    let score = q.match_path(path, KIND_FILE, 0, 0)?;
+    Some(Found { path: PathBuf::from(std::ffi::OsStr::from_bytes(path)), kind: KIND_FILE, size: 0, mtime: 0, score })
 }
 
 /// The most hits a search looks through for a page that passes its globs.
@@ -750,7 +801,7 @@ fn glob_exts(g: &str) -> Vec<Vec<u8>> {
 fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
     let engine = &cx.engine;
     let (mut q, sels) = parse_request(v, engine.home())?;
-    let x = Extras::parse(v, &mut q, sels, false, true)?;
+    let x = Extras::parse(v, &mut q, sels, false, true, engine.home())?;
     let mode = match v.get("mode").and_then(Value::as_str) {
         Some("regex") => GrepMode::Regex,
         Some("symbol") => GrepMode::Symbol,
@@ -770,11 +821,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         (None, Some(p)) => fsearch::Grep::with_case(&p, mode, case)?,
         (None, None) => return Err("grep needs a pattern".into()),
     };
-    let file = v.get("file").and_then(Value::as_str).map(|f| match f.strip_prefix('~') {
-        Some(r) => format!("{}{r}", engine.home()),
-        None if !f.starts_with('/') => format!("{}/{f}", engine.home()),
-        None => f.to_string(),
-    });
+    let file = v.get("file").and_then(Value::as_str).map(|f| String::from_utf8_lossy(&resolve(f, engine.home(), x.cwd.as_deref())).into_owned());
     let num = |k: &str| v.get(k).and_then(Value::as_u64).map(|n| n as usize);
     // One file: its matching lines, up to 200 unless told.
     g.max_per_file = num("per_file").unwrap_or(if file.is_some() { 200 } else { g.max_per_file });
@@ -802,7 +849,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
         paths.sort_by_key(|f| std::cmp::Reverse(f.mtime));
         let paths: Vec<Vec<u8>> = paths.into_iter().map(|f| f.path.as_os_str().as_bytes().to_vec()).collect();
         let mut r = fsearch::content::verify(&g, &paths, x.offset.saturating_add(q.limit).saturating_add(1));
-        let next = x.cut(&mut r.files, q.limit).or((!r.complete).then_some(x.offset + r.files.len()));
+        let next = page_next(x.cut(&mut r.files, q.limit), !r.complete, x.offset, r.files.len());
         (r, "scan", next)
     } else {
         x.ready(cx, &q)?;
@@ -821,7 +868,7 @@ fn grep(v: &Value, cx: &Ctx) -> Result<Value, String> {
                 Ok((files, cut))
             },
         )?;
-        let next = x.cut(&mut files, limit).or(cut.then_some(x.offset + files.len()));
+        let next = page_next(x.cut(&mut files, limit), cut, x.offset, files.len());
         let (mut r, indexed) = last.expect("page searched");
         r.files = files;
         (r, source(indexed), next)
@@ -962,5 +1009,63 @@ mod tests {
         let n = |a: &str, b: &str| nearness(a.as_bytes(), b.as_bytes());
         assert_eq!((n("/p/src/a.rs", "/p/src/b.rs"), n("/p/src/a.rs", "/p/src/a.rs")), (12, -20));
         assert_eq!((n("/p/src/a.rs", "/p/src/ui/c.rs"), n("/p/src/a.rs", "/p/docs/x.md"), n("/p/a/b/c/d.rs", "/q/e.rs")), (9, 6, 0));
+    }
+
+    /// An empty page does not hand back the cursor the client already sent.
+    #[test]
+    fn empty_page_has_no_next_cursor() {
+        assert_eq!(page_next(Some(5), true, 5, 0), None);
+        assert_eq!(page_next(Some(10), false, 0, 5), Some(10));
+        assert_eq!(page_next(None, true, 0, 5), Some(5));
+        assert_eq!(page_next(None, false, 0, 5), None);
+    }
+
+    /// A grep field selects grep. A path whose text contains `content:` does not.
+    #[test]
+    fn grep_field_selects_grep_and_a_path_does_not() {
+        assert!(is_content_query("search", &json!({"q": "main", "grep": "foo"})));
+        assert!(!is_content_query("search", &json!({"q": "path:/tmp/content:readme"})));
+        assert!(is_content_query("search", &json!({"q": "main content:foo"})));
+        assert!(is_content_query("grep", &json!({"q": "main"})));
+        assert!(!is_content_query("search", &json!({"q": "main"})));
+    }
+
+    /// `file`, `open`, `near`, and `cwd` join a relative path to the request cwd, else home.
+    /// Only `~` and `~/` expand.
+    #[test]
+    fn relative_paths_use_cwd_and_tilde_is_only_home() {
+        let d = std::env::temp_dir().join(format!("fsearch-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let home = d.join("home");
+        let cwd = d.join("proj");
+        std::fs::create_dir_all(home.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(home.join("src/main.rs"), "h").unwrap();
+        std::fs::write(cwd.join("src/main.rs"), "c").unwrap();
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let home_s = home.to_str().unwrap();
+        let cwd_b = cwd.as_os_str().as_bytes();
+        let rel = resolve("src/main.rs", home_s, Some(cwd_b));
+        assert_eq!(rel, cwd.join("src/main.rs").canonicalize().unwrap().as_os_str().as_bytes());
+        let tilde = resolve("~/src/main.rs", home_s, Some(cwd_b));
+        assert_eq!(tilde, home.join("src/main.rs").canonicalize().unwrap().as_os_str().as_bytes());
+        assert_eq!(resolve("~", home_s, Some(cwd_b)), home.as_os_str().as_bytes());
+        let other = resolve("~other/x", home_s, Some(cwd_b));
+        assert_ne!(other, home.join("other/x").as_os_str().as_bytes(), "tilde-user was joined onto home");
+        assert_eq!(resolve("work", home_s, None), home.join("work").canonicalize().unwrap().as_os_str().as_bytes());
+        let abs = cwd.join("src/main.rs");
+        assert_eq!(resolve(abs.to_str().unwrap(), home_s, None), abs.canonicalize().unwrap().as_os_str().as_bytes());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A deleted path still matches `git:modified`. A missing modified path does not.
+    #[test]
+    fn deleted_git_file_is_a_hit() {
+        let q = Query::parse("fsearch-deleted", "/h").unwrap();
+        let p = b"/no/such/fsearch-deleted.rs";
+        assert!(found_git(&q, p, git::DELETED).is_some());
+        assert!(found_git(&q, p, git::MODIFIED).is_none());
     }
 }

@@ -157,9 +157,7 @@ impl LazyDirs {
     }
 }
 
-/// Folders a scan was refused (EPERM): without Full Disk Access macOS also
-/// silently denies some, like ~/Library/Mail. Recorded only while paths are
-/// tracked, i.e. while SKIP is set.
+/// Folders a scan could not list. The next start tries them again.
 pub static DENIED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 /// Entries the first run's whole-disk crawl has listed so far.
@@ -254,6 +252,8 @@ pub struct Listing {
     pub id: u32,
     pub names: Vec<u8>,
     pub ents: Vec<RawEnt>,
+    /// The read failed. `ents` is empty because of that, not because the directory is empty.
+    pub failed: bool,
 }
 
 struct Ctx {
@@ -280,17 +280,25 @@ pub fn scan_disk(threads: usize) -> Vec<Listing> {
 fn scan_with(root: &[u8], threads: usize, disk: bool) -> Vec<Listing> {
     raise_fd_limit();
     let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
-    // Paths are only tracked when there is something to skip or to learn
-    // (a CACHEDIR.TAG needs its folder's path).
-    let path = (SKIP.get().is_some() || LAZY.get().is_some()).then(|| root.to_vec());
-    let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
-    if fd >= 0 {
-        if disk {
-            yield_to_searches();
-        }
-        list_fd(fd, &mut l);
-        learn_cachedir(path.as_deref(), &l);
+    // Every directory, so a refusal is recorded even when SKIP is empty (Full Disk Access).
+    let path = Some(root.to_vec());
+    let mut l = Listing { id: 0, ..Listing::default() };
+    if fd >= 0 && disk {
+        yield_to_searches();
     }
+    if fd < 0 || !list_fd(fd, &mut l) {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        if !blocked(root) {
+            l.failed = true;
+            l.ents.clear();
+            l.names.clear();
+            DENIED.lock().unwrap().push(root.to_vec());
+        }
+        return vec![l];
+    }
+    learn_cachedir(path.as_deref(), &l);
     // A folder holding no folder (most new ones) needs no pool: its threads
     // cost ~120 us of CPU a scan, most of what a burst of new folders costs.
     if !l.ents.iter().any(|e| e.kind & 3 == KIND_DIR && e.kind & FLAG_MOUNT == 0) {
@@ -329,7 +337,7 @@ pub fn list_one(path: &[u8]) -> Option<Listing> {
     if blocked(path) {
         return None;
     }
-    let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+    let mut l = Listing::default();
     if !list_into(path, &mut l) {
         // Gone, or no longer a folder: it holds no tag now.
         learn_cachedir(Some(path), &Listing::default());
@@ -366,15 +374,24 @@ impl Drop for Fd {
 // 18% of directories are empty: those the parent's listing already says
 // so (rechecked with one lookup) are never opened.
 fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
-    let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
-    if fd < 0 {
+    let mut l = Listing { id, ..Listing::default() };
+    if fd >= 0 && ctx.disk {
+        yield_to_searches();
+    }
+    // An open or a listing that fails is not an empty directory.
+    if fd < 0 || !list_fd(fd, &mut l) {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        l.failed = true;
+        l.ents.clear();
+        l.names.clear();
+        if let Some(p) = &path {
+            DENIED.lock().unwrap().push(p.clone());
+        }
         push(l, ctx);
         return;
     }
-    if ctx.disk {
-        yield_to_searches();
-    }
-    list_fd(fd, &mut l);
     learn_cachedir(path.as_deref(), &l);
     descend(s, fd, path, l, ctx);
 }
@@ -405,19 +422,13 @@ fn descend<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, mut l: Listing, ct
     }
     push(l, ctx);
     for id in empty {
-        push(Listing { id, names: Vec::new(), ents: Vec::new() }, ctx);
+        push(Listing { id, ..Listing::default() }, ctx);
     }
     for (name, cid, child_path) in kids {
         let parent = me.clone();
         s.spawn(move |s| {
             let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
             drop(parent);
-            if fd < 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                && let Some(p) = &child_path
-            {
-                DENIED.lock().unwrap().push(p.clone());
-            }
             finish_dir(s, fd, child_path, cid, ctx);
         });
     }
@@ -461,19 +472,20 @@ fn rd64(b: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-/// Returns false if the directory could not be opened.
+/// Returns false if the directory could not be opened or listed.
 fn list_into(path: &[u8], l: &mut Listing) -> bool {
     let Ok(cpath) = CString::new(path) else { return false };
     let fd = unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) };
     if fd < 0 {
         return false;
     }
-    list_fd(fd, l);
+    let ok = list_fd(fd, l);
     unsafe { libc::close(fd) };
-    true
+    ok
 }
 
-fn list_fd(fd: i32, l: &mut Listing) {
+/// False when `getattrlistbulk` fails. `n == 0` is the end of the directory.
+fn list_fd(fd: i32, l: &mut Listing) -> bool {
     let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
     al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     al.commonattr =
@@ -483,8 +495,14 @@ fn list_fd(fd: i32, l: &mut Listing) {
     BUF.with_borrow_mut(|buf| {
         loop {
             let n = unsafe { libc::getattrlistbulk(fd, &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-            if n <= 0 {
-                break;
+            if n < 0 {
+                l.ents.clear();
+                l.names.clear();
+                l.failed = true;
+                return false;
+            }
+            if n == 0 {
+                return true;
             }
             // Size the listing exactly: 8M entries' worth of growth slack
             // would be ~150 MB at the scan's peak.
@@ -506,7 +524,7 @@ fn list_fd(fd: i32, l: &mut Listing) {
                 p += len;
             }
         }
-    });
+    })
 }
 
 fn parse_entry(b: &[u8], l: &mut Listing) {
@@ -648,10 +666,15 @@ mod tests {
         let ent = |off: usize, len: usize, kind, child| RawEnt { name_off: off as u32, name_len: len as u16, kind, size: 0, mtime: 0, child };
         let tag = CACHE_TAG.len();
         let ls = vec![
-            Listing { id: 0, names: b"pq".to_vec(), ents: vec![ent(0, 1, KIND_DIR, 1), ent(1, 1, KIND_DIR, 2)] },
-            Listing { id: 1, names: b"target".to_vec(), ents: vec![ent(0, 6, KIND_DIR, 3)] },
-            Listing { id: 2, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_DIR, 4)] },
-            Listing { id: 3, names: [CACHE_TAG, b"debug"].concat(), ents: vec![ent(0, tag, KIND_FILE, NONE), ent(tag, 5, KIND_DIR, 5)] },
+            Listing { id: 0, names: b"pq".to_vec(), ents: vec![ent(0, 1, KIND_DIR, 1), ent(1, 1, KIND_DIR, 2)], failed: false },
+            Listing { id: 1, names: b"target".to_vec(), ents: vec![ent(0, 6, KIND_DIR, 3)], failed: false },
+            Listing { id: 2, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_DIR, 4)], failed: false },
+            Listing {
+                id: 3,
+                names: [CACHE_TAG, b"debug"].concat(),
+                ents: vec![ent(0, tag, KIND_FILE, NONE), ent(tag, 5, KIND_DIR, 5)],
+                failed: false,
+            },
             Listing { id: 4, ..Default::default() },
             Listing { id: 5, ..Default::default() },
         ];
@@ -663,7 +686,7 @@ mod tests {
         // With the defaults off, nothing is learned.
         let s = LazyDirs::build(b"/h", true);
         s.seed(&crate::index::Index::build(
-            vec![Listing { id: 0, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_FILE, NONE)] }],
+            vec![Listing { id: 0, names: CACHE_TAG.to_vec(), ents: vec![ent(0, tag, KIND_FILE, NONE)], failed: false }],
             0,
             0,
             b"/h",
@@ -711,6 +734,7 @@ mod tests {
             id: 0,
             names: b"CACHEDIR.TAG".to_vec(),
             ents: vec![RawEnt { name_off: 0, name_len: 12, kind: KIND_FILE, size: 0, mtime: 0, child: NONE }],
+            failed: false,
         };
         // Learned when the tag is listed, forgotten when it isn't.
         let _ = LAZY.set(LazyDirs::build(b"/h", false));
@@ -736,5 +760,13 @@ mod tests {
         s.prune();
         assert!(s.cachedir.read().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `getattrlistbulk` failing is not the end of an empty directory.
+    #[test]
+    fn list_error_is_not_eof() {
+        let mut l = Listing::default();
+        assert!(!list_fd(-1, &mut l));
+        assert!(l.failed && l.ents.is_empty());
     }
 }

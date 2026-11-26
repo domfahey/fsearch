@@ -131,6 +131,8 @@ struct Shared {
     replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
     content_seen: Mutex<Option<std::time::SystemTime>>,
+    /// Follower: index.bin's mtime when it was last loaded. A later save can reuse the event id.
+    index_seen: Mutex<Option<std::time::SystemTime>>,
     /// First run, until the whole disk is listed: indexes of just the
     /// folders searches asked about (see `with_names`).
     early: Mutex<Vec<Arc<Early>>>,
@@ -299,6 +301,7 @@ impl Engine {
             ours,
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
+            index_seen: Mutex::new(None),
             early: Mutex::new(Vec::new()),
             content_ready,
             content_early: Mutex::new(Vec::new()),
@@ -342,6 +345,9 @@ impl Engine {
                 },
             };
             *s.live.write().unwrap() = Some(live);
+            if let Ok(t) = std::fs::metadata(s.dir.join("index.bin")).and_then(|m| m.modified()) {
+                *s.index_seen.lock().unwrap() = Some(t);
+            }
             s.early.lock().unwrap().clear();
             *s.loading.0.lock().unwrap() = false;
             s.loading.1.notify_all();
@@ -603,15 +609,21 @@ impl Shared {
         let path = self.dir.join("index.bin");
         let saved = Index::saved_event_id(&path).unwrap_or(0);
         let ours = self.live.read().unwrap().as_ref().map_or(0, |l| l.base.event_id);
-        if saved > ours
-            && let Some(base) = Index::load(&path)
-        {
-            log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
-            if let Some(z) = walk::LAZY.get() {
-                z.seed(&base);
+        if let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+            let seen = *self.index_seen.lock().unwrap();
+            if index_is_newer(saved, ours, mtime, seen) {
+                if let Some(base) = Index::load(&path) {
+                    log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
+                    if let Some(z) = walk::LAZY.get() {
+                        z.seed(&base);
+                    }
+                    self.watch(base.event_id);
+                    *self.live.write().unwrap() = Some(Live::new(base));
+                    *self.index_seen.lock().unwrap() = Some(mtime);
+                }
+            } else {
+                *self.index_seen.lock().unwrap() = Some(mtime);
             }
-            self.watch(base.event_id);
-            *self.live.write().unwrap() = Some(Live::new(base));
         }
         let cdir = self.dir.join("content");
         let changed = std::fs::metadata(&cdir).and_then(|m| m.modified()).ok();
@@ -639,6 +651,8 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
     }
     s.owner.store(true, Ordering::Relaxed);
     log("took over the index from a previous owner");
+    // Load what the owner saved before this process compacts its older memory over that file.
+    s.follow();
     *s.content.write().unwrap() = Content::open(s.dir.join("content"));
     rescan_unskipped(s);
     start_content(s);
@@ -648,6 +662,30 @@ fn try_upgrade(s: &Arc<Shared>) -> bool {
 /// Next to index.bin: the folders it lacks for want of access, one per
 /// line (skipped, or refused by macOS).
 const SKIPPED: &str = "skipped";
+
+/// Save `idx` and record the folders it could not list. A failed save leaves `skipped` alone:
+/// that file describes the index on disk, and the next start trusts it.
+fn saved_index(idx: Index, dir: &Path) -> Index {
+    let path = dir.join("index.bin");
+    match idx.save(&path) {
+        Ok(()) => {
+            note_skipped(dir);
+            // Re-map from the file so the index is clean, evictable page cache
+            // rather than anonymous memory.
+            Index::load(&path).unwrap_or(idx)
+        }
+        Err(e) => {
+            log(format!("save failed: {e}"));
+            idx
+        }
+    }
+}
+
+/// A saved index should replace the one in memory: a higher event id, or the
+/// same id written again (a rescan does not advance the id).
+fn index_is_newer(saved_id: u64, our_id: u64, file_mtime: std::time::SystemTime, seen: Option<std::time::SystemTime>) -> bool {
+    saved_id > our_id || seen.is_some_and(|t| file_mtime > t)
+}
 
 fn note_skipped(dir: &Path) {
     let denied = walk::DENIED.lock().unwrap();
@@ -719,7 +757,7 @@ fn folder_listings(dir: &[u8]) -> Vec<Listing> {
         path = crate::live::join(&path, c);
         let descend = e.kind & 3 == KIND_DIR && e.kind & walk::FLAG_MOUNT == 0 && !walk::blocked(&path);
         let child = if descend { i as u32 + 1 } else { NONE };
-        out.push(Listing { id: i as u32, names: c.to_vec(), ents: vec![RawEnt { name_off: 0, child, ..e }] });
+        out.push(Listing { id: i as u32, names: c.to_vec(), ents: vec![RawEnt { name_off: 0, child, ..e }], failed: false });
         if !descend {
             return out;
         }
@@ -938,17 +976,10 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     let started = crate::query::now_secs();
     let ls = walk::scan_disk(SCAN_THREADS);
     let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    let saved = idx.save(&path);
-    if let Err(e) = &saved {
-        log(format!("save failed: {e}"));
-    }
-    note_skipped(&shared.dir);
+    let idx = saved_index(idx, &shared.dir);
     log(format!("indexed {} entries in {:.2?}", idx.n, t.elapsed()));
     release_memory();
-    // Re-map from the file so the index is clean, evictable page cache
-    // rather than anonymous memory. (After a failed save the file is older.)
-    if saved.is_ok() { Index::load(&path).unwrap_or(idx) } else { idx }
+    idx
 }
 
 unsafe extern "C" {
@@ -968,15 +999,7 @@ fn compact(shared: &Shared) {
         let live = g.as_ref().unwrap();
         (live.to_listings(), live.event_id, live.synced_at)
     };
-    let idx = Index::build(ls, eid, synced, shared.home.as_bytes());
-    let path = shared.dir.join("index.bin");
-    let saved = idx.save(&path);
-    if let Err(e) = &saved {
-        log(format!("save failed: {e}"));
-    }
-    note_skipped(&shared.dir);
-    // (After a failed save the file is older: keep the one just built.)
-    let idx = if saved.is_ok() { Index::load(&path).unwrap_or(idx) } else { idx };
+    let idx = saved_index(Index::build(ls, eid, synced, shared.home.as_bytes()), &shared.dir);
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));
     // Rare enough to afford the lstats: forget cache dirs whose tag is gone.
@@ -1508,6 +1531,36 @@ mod tests {
         e
     }
 
+    /// The same event id with a newer file is a new save. An equal mtime is not.
+    #[test]
+    fn same_event_id_newer_mtime_reloads() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(!index_is_newer(5, 5, t0, None));
+        assert!(!index_is_newer(5, 5, t0, Some(t0)));
+        assert!(index_is_newer(5, 5, t1, Some(t0)));
+        assert!(index_is_newer(6, 5, t0, Some(t1)));
+    }
+
+    /// `skipped` is rewritten only after the index file is replaced.
+    #[test]
+    fn skipped_only_after_a_successful_save() {
+        let d = std::env::temp_dir().join(format!("fsearch-skipped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let idx = Index::build(vec![Listing::default()], 1, 0, b"/h");
+        let _ = saved_index(idx, &d);
+        assert!(d.join("skipped").is_file());
+        std::fs::remove_file(d.join("skipped")).unwrap();
+        std::fs::remove_file(d.join("index.bin")).unwrap();
+        std::fs::create_dir(d.join("index.bin")).unwrap();
+        let idx = Index::build(vec![Listing::default()], 1, 0, b"/h");
+        let _ = saved_index(idx, &d);
+        let wrote = d.join("skipped").exists();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!wrote, "a failed save rewrote skipped");
+    }
+
     /// Home written with a trailing slash is home: content scope and the
     /// gated folders compare paths to it.
     #[test]
@@ -1660,6 +1713,7 @@ mod tests {
             ours: d.as_os_str().as_bytes().to_vec(),
             replaying: AtomicBool::new(false),
             content_seen: Mutex::new(None),
+            index_seen: Mutex::new(None),
             early: Mutex::new(Vec::new()),
             content_ready: AtomicBool::new(true),
             content_early: Mutex::new(Vec::new()),
@@ -1718,7 +1772,7 @@ mod tests {
         let comps: Vec<&[u8]> = path.as_os_str().as_bytes().split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
         let dir = |i: usize, c: &[u8]| {
             let e = RawEnt { name_off: 0, name_len: c.len() as u16, kind: KIND_DIR, size: 0, mtime: 0, child: i as u32 + 1 };
-            Listing { id: i as u32, names: c.to_vec(), ents: vec![e] }
+            Listing { id: i as u32, names: c.to_vec(), ents: vec![e], failed: false }
         };
         let mut ls: Vec<Listing> = comps.iter().enumerate().map(|(i, c)| dir(i, c)).collect();
         ls.push(Listing { id: comps.len() as u32, ..Default::default() });

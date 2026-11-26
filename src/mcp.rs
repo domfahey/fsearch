@@ -279,7 +279,7 @@ impl Session {
             }
         }
         // Nothing the project tracks: maybe in what git ignores (build output).
-        let r = self.ask(&req(&p.words, false)).unwrap_or_default();
+        let r = value_of(self.ask(&req(&p.words, false)))?;
         let hits = r["hits"].as_array().cloned().unwrap_or_default();
         if !hits.is_empty() {
             return Ok(v.list_files(&hits, &p.words, r["next"].as_u64(), Some("0 matches outside git-ignored files; ignored:".into())));
@@ -336,7 +336,8 @@ impl Session {
         if let Some(s) = scope {
             (changed["in"], recent["in"]) = (s.as_str().into(), s.as_str().into());
         }
-        let mut hits = self.ask(&changed).ok().and_then(|r| r["hits"].as_array().cloned()).unwrap_or_default();
+        let changed_v = value_of(self.ask(&changed))?;
+        let mut hits = changed_v["hits"].as_array().cloned().unwrap_or_default();
         hits.truncate(max);
         for h in self.ask(&recent)?["hits"].as_array().cloned().unwrap_or_default() {
             if hits.len() < max && !hits.iter().any(|o| o["path"] == h["path"]) {
@@ -570,6 +571,11 @@ fn lead(r: &mut Value, defs: &[Value]) {
     }
 }
 
+/// A daemon answer, or its error. An error is not an empty success.
+fn value_of(r: Result<Value, String>) -> Result<Value, String> {
+    r
+}
+
 /// How a call shows paths (see `Session::view`).
 struct View {
     base: String,
@@ -723,7 +729,7 @@ impl View {
                 }
             }
         }
-        if r["next"].as_u64().is_some() || taken < ranked.len() {
+        if taken > 0 && (r["next"].as_u64().is_some() || taken < ranked.len()) {
             out.push(format!("cursor: {}", offset + taken));
         }
         if r["complete"] == false {
@@ -1326,6 +1332,23 @@ mod tests {
         let r = json!({"files": [d, f("/p/src/b.rs", "parse")], "next": 1});
         let out = v.list_matches(&r, "parse", false, Some("parse"), Out::Content, 2, 0, 0, None);
         assert_ne!(out.lines().find_map(|l| l.strip_prefix("cursor: ")), Some("0"));
+    }
+
+    /// A git-status failure is not an empty file list.
+    #[test]
+    fn git_status_error_is_not_an_empty_list() {
+        let err = value_of(Err("still reading the git status".into()));
+        assert!(err.is_err(), "{err:?}");
+        let ok = value_of(Ok(json!({"ok": true, "hits": []}))).unwrap();
+        assert!(ok["hits"].as_array().unwrap().is_empty());
+    }
+
+    /// An empty page whose `next` is the cursor the client already sent does not ask for that page again.
+    #[test]
+    fn empty_page_does_not_repeat_the_cursor() {
+        let r = json!({"files": [], "next": 5});
+        let out = View { base: "/p".into(), head: None }.list_matches(&r, "x", false, None, Out::Content, 10, 0, 5, None);
+        assert!(out.lines().all(|l| !l.starts_with("cursor:")), "{out}");
     }
 
     #[test]
