@@ -4931,7 +4931,7 @@ mod tests {
         std::fs::write(&bad, "secret\n").unwrap();
         std::fs::write(&bin, b"a\0b\0c").unwrap();
         let mut perms = std::fs::metadata(&bad).unwrap().permissions();
-        perms.set_mode(0);
+        perms.set_mode(0o0);
         std::fs::set_permissions(&bad, perms.clone()).unwrap();
         let mut docs = Docs::default();
         docs.push(good.as_os_str().as_bytes(), 6, 1);

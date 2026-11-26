@@ -620,7 +620,7 @@ fn covers(p: &[u8], dirs: &HashMap<Vec<u8>, bool>) -> bool {
 
 /// A directory mark this update will drop, so status must be asked about it again.
 fn dir_mark_drops(p: &[u8], dirs: &HashMap<Vec<u8>, bool>, restaged: &HashSet<Vec<u8>>) -> bool {
-    covers(p, dirs) || (!p.is_empty() && restaged.iter().any(|r| r.starts_with(&[&p[..], b"/"].concat())))
+    covers(p, dirs) || (!p.is_empty() && restaged.iter().any(|r| r.starts_with(&[p, b"/"].concat())))
 }
 
 /// Merge one status read into `old`: drop what the pathspecs covered, keep the rest, insert `found`.
@@ -770,8 +770,7 @@ mod tests {
         let d = d.canonicalize().unwrap();
         let g = Git::new("/nonexistent-fsearch-home");
         let r = g.add(d.as_os_str().as_bytes());
-        let mut snap = Snap::default();
-        snap.untrusted = true;
+        let snap = Snap { untrusted: true, ..Snap::default() };
         *r.snap.write().unwrap() = Some(Arc::new(snap));
         let file = [d.as_os_str().as_bytes(), b"/a.rs"].concat();
         assert_eq!(g.status(&file), None);
@@ -791,7 +790,7 @@ mod tests {
         let mut dirs = HashMap::new();
         dirs.insert(b"newlib".to_vec(), false);
         let s = apply_status(&old, &dirs, &HashSet::new(), vec![(b"newlib/b".to_vec(), UNTRACKED)]);
-        assert!(s.dirs.get(&b"newlib"[..]).is_none(), "non-recursive update kept the directory mark");
+        assert!(!s.dirs.contains_key(&b"newlib"[..]), "non-recursive update kept the directory mark");
         assert_eq!(s.files.get(&b"newlib/a"[..]), None);
         assert_eq!(s.files.get(&b"newlib/b"[..]), Some(&UNTRACKED));
         assert_eq!(s.files.get(&b"src/x.rs"[..]), Some(&MODIFIED));
@@ -802,7 +801,7 @@ mod tests {
         let restaged = HashSet::from([b"newlib/a".to_vec()]);
         assert!(dir_mark_drops(b"newlib", &HashMap::new(), &restaged));
         let s = apply_status(&old, &HashMap::new(), &restaged, vec![(b"newlib/b".to_vec(), UNTRACKED)]);
-        assert!(s.dirs.get(&b"newlib"[..]).is_none(), "ancestor of a restaged path");
+        assert!(!s.dirs.contains_key(&b"newlib"[..]), "ancestor of a restaged path");
         assert_eq!(s.dirs.get(&b"other"[..]), Some(&UNTRACKED));
         assert_eq!(s.files.get(&b"newlib/b"[..]), Some(&UNTRACKED));
     }

@@ -696,8 +696,8 @@ mod tests {
         let mut live = Live::new(base_for(&root));
         let alive = |live: &Live, p: &[u8]| live.base.lookup(p).is_some_and(|e| !live.is_dead(e)) || live.over.contains_key(p);
         assert!(alive(&live, &file));
-        let mut perms = std::fs::metadata(&d.join("sub")).unwrap().permissions();
-        perms.set_mode(0);
+        let mut perms = std::fs::metadata(d.join("sub")).unwrap().permissions();
+        perms.set_mode(0o0);
         std::fs::set_permissions(d.join("sub"), perms.clone()).unwrap();
         live.apply_dir(&sub_path, true);
         perms.set_mode(0o755);
@@ -725,7 +725,7 @@ mod tests {
         let alive = |live: &Live, p: &[u8]| live.base.lookup(p).is_some_and(|e| !live.is_dead(e)) || live.over.contains_key(p);
         assert!(alive(&live, &file));
         let mut perms = std::fs::metadata(d.join("sub")).unwrap().permissions();
-        perms.set_mode(0);
+        perms.set_mode(0o0);
         std::fs::set_permissions(d.join("sub"), perms.clone()).unwrap();
         live.apply_dir(&root, true);
         perms.set_mode(0o755);
